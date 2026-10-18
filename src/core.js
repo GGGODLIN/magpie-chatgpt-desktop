@@ -405,11 +405,50 @@ ${buildResolverJs(preferredExports)}
   }
 })()`;
 
+// OpenAI / Magpie 標準 reasoning_effort（low/medium/high/minimal/xhigh）與
+// ChatGPT Desktop 內部 /f/conversation 的 thinking_effort（min/standard/extended/max）名稱不同；
+// 直接原樣送出會導致 /f/conversation 拒絕連線，且 -pro 模型僅支援 standard。
+export const normalizeThinkingEffort = (effort, modelSlug = "") => {
+  const raw = String(effort ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  const slug = String(modelSlug ?? "").trim().toLowerCase();
+  if (slug.endsWith("-pro")) {
+    return "standard";
+  }
+  switch (raw) {
+    case "min":
+    case "minimal":
+    case "low":
+    case "light":
+      return "min";
+    case "standard":
+    case "medium":
+    case "normal":
+    case "default":
+    case "none":
+      return "standard";
+    case "extended":
+    case "high":
+      return "extended";
+    case "max":
+    case "xhigh":
+    case "heavy":
+      return "max";
+    default:
+      return "standard";
+  }
+};
+
 export const buildChatExpression = (
   options,
   preferredExports = preferredClientExports(),
-) => `(async () => {
-  const options = ${JSON.stringify(options)};
+) => {
+  const normalizedOptions = {
+    ...options,
+    effort: normalizeThinkingEffort(options?.effort, options?.model),
+  };
+  return `(async () => {
+  const options = ${JSON.stringify(normalizedOptions)};
   const events = [];
   let sendAttempted = false;
   let streamError = null;
@@ -597,6 +636,7 @@ ${buildResolverJs(preferredExports)}
     };
   }
 })()`;
+};
 
 const NON_TEXT_KEYS = [
   "image_url",

@@ -17,6 +17,7 @@ import {
   formatMessagesToPrompt,
   getRendererTarget,
   listModels,
+  normalizeThinkingEffort,
   parsePortFromCommandArgs,
   preferredClientExports,
   probeClient,
@@ -706,8 +707,42 @@ describe("Ticket 01 — 自動降級 Instant 開關（涵蓋 Pro 與 Thinking）
         INSTANT_MODEL,
       ]);
       // Instant 重送時不帶 thinking_effort
+      expect(mock.state.requests[0].thinking_effort).toBe("extended");
       expect(mock.state.requests[1].thinking_effort).toBeUndefined();
+      expect(mock.state.requests[2].thinking_effort).toBe("standard");
       expect(mock.state.requests[3].thinking_effort).toBeUndefined();
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("OpenAI 標準 reasoning_effort（low/medium/high/minimal/xhigh）自動正規化為 ChatGPT Desktop thinking_effort，且 -pro 固定為 standard", async () => {
+    expect(normalizeThinkingEffort("low", THINKING_MODEL)).toBe("min");
+    expect(normalizeThinkingEffort("minimal", THINKING_MODEL)).toBe("min");
+    expect(normalizeThinkingEffort("medium", THINKING_MODEL)).toBe("standard");
+    expect(normalizeThinkingEffort("high", THINKING_MODEL)).toBe("extended");
+    expect(normalizeThinkingEffort("xhigh", THINKING_MODEL)).toBe("max");
+    expect(normalizeThinkingEffort("high", PRO_MODEL)).toBe("standard");
+    expect(normalizeThinkingEffort("", THINKING_MODEL)).toBe("");
+
+    const mock = await startMockCdpServer({ kind: "success" });
+    try {
+      await sendConversation({
+        cdpUrl: mock.cdpUrl,
+        model: THINKING_MODEL,
+        effort: "low",
+        prompt: "low effort prompt",
+      });
+      await sendConversation({
+        cdpUrl: mock.cdpUrl,
+        model: THINKING_MODEL,
+        effort: "high",
+        prompt: "high effort prompt",
+      });
+      expect(mock.state.requests.map((r) => r.thinking_effort)).toEqual([
+        "min",
+        "extended",
+      ]);
     } finally {
       mock.stop();
     }
