@@ -120,9 +120,10 @@ export const findFreeHighPort = async ({
 export const detectRunningChatGPTPort = ({ execSyncImpl = execSync } = {}) => {
   try {
     const output = String(
-      execSyncImpl("ps -ax -o command=", {
+      execSyncImpl("/bin/ps -ax -o command=", {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
       }),
     );
     const lines = output

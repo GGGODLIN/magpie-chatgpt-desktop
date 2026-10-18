@@ -71,12 +71,14 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
       };
     }
 
+    const sysEnv = { ...process.env, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
     let lines = [];
     try {
       const output = String(
-        execSync("ps -ax -o command=", {
+        execSync("/bin/ps -ax -o command=", {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
+          env: sysEnv,
         }),
       );
       lines = output
@@ -92,8 +94,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
       pluginOptions?.cdpUrl ??
         pluginOptions?.port ??
         process.env.CHATGPT_CDP_PORT ??
-        process.env.CODEX_CDP_PORT ??
-        process.env.SIDECAR_CDP,
+        process.env.SIDECAR_CDP ??
+        process.env.CODEX_CDP_PORT,
     );
     const cdpUrl =
       configured?.cdpUrl ??
@@ -156,11 +158,12 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
         current.cdpUrl = null;
         fs.writeFileSync(stateFile, JSON.stringify(current, null, 2));
       } else {
+        const sysEnv = { ...process.env, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
         try {
           execFileSync(
-            "osascript",
+            "/usr/bin/osascript",
             ["-e", 'tell application "ChatGPT" to quit'],
-            { stdio: "ignore" },
+            { stdio: "ignore", env: sysEnv },
           );
         } catch {
           // 忽略 osascript 例外，後續以程序輪詢確認退出狀態。
@@ -200,9 +203,12 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
       fs.writeFileSync(stateFile, JSON.stringify(current, null, 2));
     } else {
       execFileSync(
-        "open",
+        "/usr/bin/open",
         ["-a", appPath, "--args", `--remote-debugging-port=${resolved.port}`],
-        { stdio: "ignore" },
+        {
+          stdio: "ignore",
+          env: { ...process.env, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+        },
       );
     }
 
