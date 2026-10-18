@@ -21,5 +21,8 @@
     "desktop",
     "cdp"
   ],
+  "magpie": {
+    "maxConcurrency": 1
+  },
   "license": "MIT"
 }

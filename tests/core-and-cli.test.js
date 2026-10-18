@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runCli } from "../src/cli.js";
 import {
   ChatGPTDesktopError,
   DEFAULT_CDP_PORT,
@@ -20,36 +21,11 @@ import {
   preferredClientExports,
   probeClient,
   resolveCdpPort,
-   runCli,
   sendConversation,
-} from "../src/index.js";
+} from "../src/core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.resolve(__dirname, "../src/cli.js");
-
-const runCliSubprocess = (args, { input, env } = {}) =>
-  new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI_PATH, ...args], {
-      env: env ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (status) => {
-      resolve({ status, stdout, stderr });
-    });
-    if (input !== undefined) {
-      child.stdin.write(input);
-    }
-    child.stdin.end();
-  });
 
 const THINKING_MODEL = "gpt-5-6-thinking";
 const PRO_MODEL = "gpt-6-pro";
@@ -166,7 +142,179 @@ const startMockCdpServer = async (scenario = {}) => {
         }
 
         const expression = cmd.params.expression;
-        const evalResult = await executeRendererExpression(expression, scenario);
+        const catalog = scenario.catalog ?? DEFAULT_CATALOG;
+        const answer = scenario.answer ?? DEFAULT_ANSWER;
+        const exportName = scenario.exportName ?? "cF";
+        const moduleSourceFor = (targetExportName) => {
+          if (scenario.noClientExports) {
+            return `  export default { foo: "bar" };`;
+          }
+          return [
+            `  const scenario = ${JSON.stringify(scenario)};`,
+            `  const catalog = ${JSON.stringify(catalog)};`,
+            `  const answer = ${JSON.stringify(answer)};`,
+            `  export const ${targetExportName} = {`,
+            `    safeGet: async (path) => {`,
+            `      globalThis.__testReads.push(path);`,
+            `      if (path === "/ios/attestation_challenge") {`,
+            `        if (scenario.attestationFails) throw new Error("401 unauthorized");`,
+            `        return { attestation_challenge: "challenge-token-xyz" };`,
+            `      }`,
+            `      if (path.startsWith("/models")) {`,
+            `        if (scenario.noInstant) return { models: [], versions: [] };`,
+            `        if (scenario.proAsInstant) {`,
+            `          return {`,
+            `            models: [{ slug: "gpt-6-pro", is_work_mode_model: false }],`,
+            `            versions: [{`,
+            `              enabled: true,`,
+            `              intelligence_presets: [`,
+            `                { model_slug: "gpt-5-6-thinking", lane: "thinking", preset_type: "available" },`,
+            `                { model_slug: "gpt-6-pro", lane: "instant", preset_type: "available" },`,
+            `              ],`,
+            `            }],`,
+            `          };`,
+            `        }`,
+            `        if (scenario.workModeInstant) {`,
+            `          return {`,
+            `            models: [{ slug: "gpt-5-6-instant", is_work_mode_model: true }],`,
+            `            versions: [{`,
+            `              enabled: true,`,
+            `              intelligence_presets: [`,
+            `                { model_slug: "gpt-5-6-thinking", lane: "thinking", preset_type: "available" },`,
+            `                { model_slug: "gpt-5-6-instant", lane: "instant", preset_type: "available" },`,
+            `              ],`,
+            `            }],`,
+            `          };`,
+            `        }`,
+            `        return catalog;`,
+            `      }`,
+            `      if (scenario.kind === "accepted-quota" || scenario.emptyConversation) {`,
+            `        return { mapping: {} };`,
+            `      }`,
+            `      const requestedSlug = globalThis.__testRequests.at(-1)?.model ?? null;`,
+            `      return {`,
+            `        mapping: {`,
+            `          nodeThought: {`,
+            `            message: {`,
+            `              author: { role: "assistant" },`,
+            `              status: "finished_successfully",`,
+            `              content: { content_type: "thought", parts: ["internal thought that must be skipped"] },`,
+            `              create_time: 200,`,
+            `              metadata: { model_slug: requestedSlug },`,
+            `            },`,
+            `          },`,
+            `          nodeReasoning: {`,
+            `            message: {`,
+            `              author: { role: "assistant" },`,
+            `              status: "finished_successfully",`,
+            `              content: { content_type: "reasoning", parts: ["internal reasoning that must be skipped"] },`,
+            `              create_time: 300,`,
+            `              metadata: { model_slug: requestedSlug },`,
+            `            },`,
+            `          },`,
+            `          nodeInProgress: {`,
+            `            message: {`,
+            `              author: { role: "assistant" },`,
+            `              status: "in_progress",`,
+            `              content: { content_type: "text", parts: ["unfinished draft"] },`,
+            `              create_time: 400,`,
+            `              metadata: { model_slug: requestedSlug },`,
+            `            },`,
+            `          },`,
+            `          nodeFinal: {`,
+            `            message: {`,
+            `              author: { role: "assistant" },`,
+            `              status: "finished_successfully",`,
+            `              content: { content_type: "text", parts: [answer] },`,
+            `              create_time: 100,`,
+            `              metadata: { model_slug: requestedSlug },`,
+            `            },`,
+            `          },`,
+            `        },`,
+            `      };`,
+            `    },`,
+            `    streamPost: (_path, init) => {`,
+            `      const body = JSON.parse(init.body);`,
+            `      globalThis.__testRequests.push(body);`,
+            `      const quota = { detail: { code: "model_cap_exceeded", message: "Allowance exhausted" } };`,
+            `      if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {`,
+            `        init.onComplete({ conversation_id: "conv-123" });`,
+            `      } else if (scenario.kind === "rate") {`,
+            `        init.onError({ status: 429, error: { code: "rate_limit_exceeded" } });`,
+            `      } else if (scenario.kind === "conflicting-code") {`,
+            `        init.onError({ code: "rate_limit_exceeded", message: JSON.stringify(quota) });`,
+            `      } else if (scenario.kind === "premature") {`,
+            `        init.onPrematureTermination();`,
+            `      } else if (scenario.kind === "accepted-quota") {`,
+            `        init.onEvent({ conversation_id: "conv-accepted" });`,
+            `        init.onError(quota);`,
+            `      } else if (scenario.kind === "partial-quota") {`,
+            `        init.onEvent({ message: { author: { role: "assistant" }, status: "in_progress" } });`,
+            `        init.onError(quota);`,
+            `      } else {`,
+            `        init.onError(quota);`,
+            `      }`,
+            `      return "stream-handle";`,
+            `    },`,
+            `    cancelStream: () => {},`,
+            `  };`,
+          ].join("\n");
+        };
+
+        const sharedModuleCode = scenario.sharedRpcPromiseOnly
+          ? [
+              `  export default {`,
+              `    safeGet: Object.assign(() => {}, { toString: () => "[object RpcPromise]" }),`,
+              `    streamPost: () => {},`,
+              `    cancelStream: () => {},`,
+              `  };`,
+            ].join("\n")
+          : moduleSourceFor(exportName);
+
+        const initialModuleCode = moduleSourceFor(
+          scenario.initialExportName ?? "initClient",
+        );
+
+        const sharedUrl =
+          "data:text/javascript," +
+          encodeURIComponent(sharedModuleCode + "\n//") +
+          `#/assets/app-shared-${crypto.randomUUID()}.js`;
+        const initialUrl =
+          "data:text/javascript," +
+          encodeURIComponent(initialModuleCode + "\n//") +
+          `#/assets/app-initial-${crypto.randomUUID()}.js`;
+
+        const resourceEntries = scenario.noModules
+          ? []
+          : [{ name: sharedUrl }, { name: initialUrl }];
+
+        const prevPerformance = globalThis.performance;
+        const prevDocument = globalThis.document;
+        const requests = [];
+        const reads = [];
+        globalThis.__testRequests = requests;
+        globalThis.__testReads = reads;
+        globalThis.performance = {
+          getEntriesByType: () => resourceEntries,
+        };
+        globalThis.document = {
+          querySelectorAll: () => [],
+        };
+
+        let evalResult;
+        try {
+          const AsyncFunction = Object.getPrototypeOf(
+            async function () {},
+          ).constructor;
+          const fn = new AsyncFunction(`return await ${expression};`);
+          const result = await fn();
+          evalResult = { result, requests, reads };
+        } finally {
+          globalThis.performance = prevPerformance;
+          globalThis.document = prevDocument;
+          delete globalThis.__testRequests;
+          delete globalThis.__testReads;
+        }
         state.requests.push(...evalResult.requests);
         state.reads.push(...evalResult.reads);
 
@@ -222,186 +370,6 @@ const startMockCdpServer = async (scenario = {}) => {
     waitForWsClose,
     stop: () => server.stop(true),
   };
-};
-
-const executeRendererExpression = async (expression, scenario = {}) => {
-  const catalog = scenario.catalog ?? DEFAULT_CATALOG;
-  const answer = scenario.answer ?? DEFAULT_ANSWER;
-  const exportName = scenario.exportName ?? "cF";
-
-  const sharedModuleCode = scenario.sharedRpcPromiseOnly
-    ? `
-export const fakeRpc = {
-  safeGet: Object.assign(() => {}, { toString: () => "[object RpcPromise]" }),
-  streamPost: () => {},
-  cancelStream: () => {},
-};
-`
-    : buildClientModuleSource({ exportName, scenario, catalog, answer });
-
-  const initialModuleCode = buildClientModuleSource({
-    exportName: scenario.initialExportName ?? "initClient",
-    scenario,
-    catalog,
-    answer,
-  });
-
-  const sharedUrl =
-    "data:text/javascript," +
-    encodeURIComponent(sharedModuleCode + "\n//") +
-    `#/assets/app-shared-${crypto.randomUUID()}.js`;
-  const initialUrl =
-    "data:text/javascript," +
-    encodeURIComponent(initialModuleCode + "\n//") +
-    `#/assets/app-initial-${crypto.randomUUID()}.js`;
-
-  const resourceEntries = scenario.noModules
-    ? []
-    : [{ name: sharedUrl }, { name: initialUrl }];
-
-  const prevPerformance = globalThis.performance;
-  const prevDocument = globalThis.document;
-  const requests = [];
-  const reads = [];
-  globalThis.__testRequests = requests;
-  globalThis.__testReads = reads;
-  globalThis.performance = {
-    getEntriesByType: () => resourceEntries,
-  };
-  globalThis.document = {
-    querySelectorAll: () => [],
-  };
-
-  try {
-    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-    const fn = new AsyncFunction(`return await ${expression};`);
-    const result = await fn();
-    return { result, requests, reads };
-  } finally {
-    globalThis.performance = prevPerformance;
-    globalThis.document = prevDocument;
-    delete globalThis.__testRequests;
-    delete globalThis.__testReads;
-  }
-};
-
-const buildClientModuleSource = ({ exportName, scenario, catalog, answer }) => {
-  if (scenario.noClientExports) {
-    return `export const notAClient = { foo: "bar" };`;
-  }
-  return `
-const scenario = ${JSON.stringify(scenario)};
-const catalog = ${JSON.stringify(catalog)};
-const answer = ${JSON.stringify(answer)};
-
-export const ${exportName} = {
-  safeGet: async (path) => {
-    globalThis.__testReads.push(path);
-    if (path === "/ios/attestation_challenge") {
-      if (scenario.attestationFails) {
-        throw new Error("401 unauthorized");
-      }
-      return { attestation_challenge: "challenge-token-xyz" };
-    }
-    if (path.startsWith("/models")) {
-      if (scenario.noInstant) return { models: [], versions: [] };
-      if (scenario.proAsInstant) {
-        return {
-          models: [{ slug: "gpt-6-pro", is_work_mode_model: false }],
-          versions: [{
-            enabled: true,
-            intelligence_presets: [
-              { model_slug: "gpt-5-6-thinking", lane: "thinking", preset_type: "available" },
-              { model_slug: "gpt-6-pro", lane: "instant", preset_type: "available" },
-            ],
-          }],
-        };
-      }
-      if (scenario.workModeInstant) {
-        return {
-          models: [{ slug: "gpt-5-6-instant", is_work_mode_model: true }],
-          versions: [{
-            enabled: true,
-            intelligence_presets: [
-              { model_slug: "gpt-5-6-thinking", lane: "thinking", preset_type: "available" },
-              { model_slug: "gpt-5-6-instant", lane: "instant", preset_type: "available" },
-            ],
-          }],
-        };
-      }
-      return catalog;
-    }
-    if (scenario.kind === "accepted-quota" || scenario.emptyConversation) {
-      return { mapping: {} };
-    }
-    const requestedSlug = globalThis.__testRequests.at(-1)?.model ?? null;
-    return {
-      mapping: {
-        nodeThought: {
-          message: {
-            author: { role: "assistant" },
-            status: "finished_successfully",
-            content: { content_type: "thought", parts: ["internal thought that must be skipped"] },
-            create_time: 200,
-            metadata: { model_slug: requestedSlug },
-          },
-        },
-        nodeReasoning: {
-          message: {
-            author: { role: "assistant" },
-            status: "finished_successfully",
-            content: { content_type: "reasoning", parts: ["internal reasoning that must be skipped"] },
-            create_time: 300,
-            metadata: { model_slug: requestedSlug },
-          },
-        },
-        nodeInProgress: {
-          message: {
-            author: { role: "assistant" },
-            status: "in_progress",
-            content: { content_type: "text", parts: ["unfinished draft"] },
-            create_time: 400,
-            metadata: { model_slug: requestedSlug },
-          },
-        },
-        nodeFinal: {
-          message: {
-            author: { role: "assistant" },
-            status: "finished_successfully",
-            content: { content_type: "text", parts: [answer] },
-            create_time: 100,
-            metadata: { model_slug: requestedSlug },
-          },
-        },
-      },
-    };
-  },
-  streamPost: (_path, init) => {
-    const body = JSON.parse(init.body);
-    globalThis.__testRequests.push(body);
-    const quota = { detail: { code: "model_cap_exceeded", message: "Allowance exhausted" } };
-    if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {
-      init.onComplete({ conversation_id: "conv-123" });
-    } else if (scenario.kind === "rate") {
-      init.onError({ status: 429, error: { code: "rate_limit_exceeded" } });
-    } else if (scenario.kind === "conflicting-code") {
-      init.onError({ code: "rate_limit_exceeded", message: JSON.stringify(quota) });
-    } else if (scenario.kind === "premature") {
-      init.onPrematureTermination();
-    } else if (scenario.kind === "accepted-quota") {
-      init.onEvent({ conversation_id: "conv-accepted" });
-      init.onError(quota);
-    } else if (scenario.kind === "partial-quota") {
-      init.onEvent({ message: { author: { role: "assistant" }, status: "in_progress" } });
-      init.onError(quota);
-    } else {
-      init.onError(quota);
-    }
-    return "stream-handle";
-  },
-  cancelStream: () => {},
-};
-`;
 };
 
 describe("Ticket 01 — 三層除錯埠決定與高號段避讓、主畫面唯一性檢查", () => {
@@ -830,13 +798,37 @@ describe("Ticket 01 — 逾時、斷線、無完成訊息與 AbortSignal 取消�
 });
 
 describe("Ticket 01 — CLI 入口 (--probe、退出碼 0/1/3、SIDECAR_WEB_RETRY_UNSAFE 與降級紀錄容錯)", () => {
+  const execCliChild = (args, { input, env } = {}) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI_PATH, ...args], {
+        env: env ?? process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", reject);
+      child.on("close", (status) => {
+        resolve({ status, stdout, stderr });
+      });
+      if (input !== undefined) {
+        child.stdin.write(input);
+      }
+      child.stdin.end();
+    });
+
   test("CLI 子程序 --probe 輸出包含 ok, challengeOk, clientExport, preferred, drifted，且斷線時回退出碼 1", async () => {
     const mock = await startMockCdpServer({
       kind: "success",
       exportName: "newExportName",
     });
     try {
-      const okProc = await runCliSubprocess(["--probe"], {
+      const okProc = await execCliChild(["--probe"], {
         env: {
           ...process.env,
           SIDECAR_CDP: mock.cdpUrl,
@@ -855,7 +847,7 @@ describe("Ticket 01 — CLI 入口 (--probe、退出碼 0/1/3、SIDECAR_WEB_RETR
     }
 
     // 關閉後再執行 --probe 應回退出碼 1 並印出 {"ok":false,"error":...}
-    const failProc = await runCliSubprocess(["--probe"], {
+    const failProc = await execCliChild(["--probe"], {
       env: {
         ...process.env,
         SIDECAR_CDP: "http://127.0.0.1:19",
@@ -902,7 +894,7 @@ describe("Ticket 01 — CLI 入口 (--probe、退出碼 0/1/3、SIDECAR_WEB_RETR
     // 3. 送出後 premature 中斷 → 退出碼 3 + SIDECAR_WEB_RETRY_UNSAFE
     const mock = await startMockCdpServer({ kind: "premature" });
     try {
-      const unsafeProc = await runCliSubprocess([THINKING_MODEL], {
+      const unsafeProc = await execCliChild([THINKING_MODEL], {
         input: "question text",
         env: {
           ...process.env,
