@@ -148,8 +148,8 @@ export const resolveCdpPort = async ({
   const candidates = [
     configuredPort,
     env?.CHATGPT_CDP_PORT,
-    env?.CODEX_CDP_PORT,
     env?.SIDECAR_CDP,
+    env?.CODEX_CDP_PORT,
   ];
   for (const candidate of candidates) {
     const parsed = parsePortOrCdpInput(candidate);
