@@ -7,6 +7,7 @@ import {
   checkPortFree,
   finishFallbackLog,
   formatMessagesToPrompt,
+  isChatGPTAppCommand,
   listModels,
   parsePortFromCommandArgs,
   parsePortOrCdpInput,
@@ -83,9 +84,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           env: sysEnv,
         }),
       );
-      lines = output
-        .split(/\r?\n/)
-        .filter((line) => line.includes("ChatGPT.app/Contents/MacOS/ChatGPT"));
+      lines = output.split(/\r?\n/).filter(isChatGPTAppCommand);
     } catch {
       lines = [];
     }

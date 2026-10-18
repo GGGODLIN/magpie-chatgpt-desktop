@@ -117,6 +117,11 @@ export const findFreeHighPort = async ({
   return DEFAULT_CDP_PORT;
 };
 
+export const isChatGPTAppCommand = (line) =>
+  /^(?:\S*\/)?ChatGPT\.app\/Contents\/MacOS\/ChatGPT(?:\s|$)/.test(
+    String(line ?? "").trim(),
+  );
+
 export const detectRunningChatGPTPort = ({ execSyncImpl = execSync } = {}) => {
   try {
     const output = String(
@@ -126,9 +131,7 @@ export const detectRunningChatGPTPort = ({ execSyncImpl = execSync } = {}) => {
         env: { ...process.env, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
       }),
     );
-    const lines = output
-      .split(/\r?\n/)
-      .filter((line) => line.includes("ChatGPT.app/Contents/MacOS/ChatGPT"));
+    const lines = output.split(/\r?\n/).filter(isChatGPTAppCommand);
     return parsePortFromCommandArgs(lines);
   } catch {
     return null;

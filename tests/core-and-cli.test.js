@@ -16,6 +16,7 @@ import {
   findFreeHighPort,
   formatMessagesToPrompt,
   getRendererTarget,
+  isChatGPTAppCommand,
   listModels,
   normalizeThinkingEffort,
   parsePortFromCommandArgs,
@@ -475,6 +476,18 @@ describe("Ticket 01 — 三層除錯埠決定與高號段避讓、主畫面唯�
       cdpUrl: "http://127.0.0.1:19333",
       source: "default",
     });
+
+    // 3c. isChatGPTAppCommand 只匹配真正的主程序路徑，不誤判含該字串的 shell 或 grep 命令
+    expect(
+      isChatGPTAppCommand(
+        "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=19333",
+      ),
+    ).toBe(true);
+    expect(
+      isChatGPTAppCommand(
+        '/bin/bash -c "grep ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=19999"',
+      ),
+    ).toBe(false);
   });
 
   test("高號段候選埠被真實 TCP 服務佔用時能自動跳過，且對主畫面數量為 0 或 >1 回傳明確階段錯誤", async () => {
