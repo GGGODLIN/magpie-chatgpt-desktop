@@ -371,7 +371,8 @@ ${buildResolverJs(preferredExports)}
         && resolved.probeValue.attestation_challenge.length > 0,
     };
   } catch (error) {
-    return { error: String(error?.message ?? error) };
+    const msg = String(error?.message ?? error).trim();
+    return { error: msg.length > 0 ? msg : "renderer 執行失敗" };
   }
 })()`;
 
@@ -398,7 +399,8 @@ ${buildResolverJs(preferredExports)}
       moduleUrl: resolved.moduleUrl,
     };
   } catch (error) {
-    return { error: String(error?.message ?? error), retrySafe: true };
+    const msg = String(error?.message ?? error).trim();
+    return { error: msg.length > 0 ? msg : "renderer 執行失敗", retrySafe: true };
   }
 })()`;
 
@@ -430,9 +432,7 @@ ${buildResolverJs(preferredExports)}
       const matchedVersion = versions.find((entry) => entry.enabled !== false
         && (entry.intelligence_presets ?? []).some((preset) => preset.model_slug === options.model
           && preset.preset_type === "available"));
-      const targetVersion = matchedVersion ?? versions.find((entry) => entry.enabled !== false
-        && (entry.intelligence_presets ?? []).some(isEligibleInstant));
-      const instant = (targetVersion?.intelligence_presets ?? []).find(isEligibleInstant);
+      const instant = (matchedVersion?.intelligence_presets ?? []).find(isEligibleInstant);
       if (!instant) return { error: "模型目錄沒有可用的同版本 Instant", stage: "quota_exceeded", retrySafe: true };
       requestModel = instant.model_slug;
     }
@@ -587,8 +587,9 @@ ${buildResolverJs(preferredExports)}
       clientExport: resolved.exportName,
     };
   } catch (error) {
+    const msg = String(error?.message ?? error).trim();
     return {
-      error: String(error?.message ?? error),
+      error: msg.length > 0 ? msg : "renderer 執行失敗",
       stage: sendAttempted ? "unknown_send_state" : "unknown",
       retrySafe: !sendAttempted,
       conversationId,
@@ -947,7 +948,13 @@ export const evaluateInRenderer = ({
         return;
       }
 
-      if (value.error) {
+      if (
+        (value.error !== undefined && value.error !== null) ||
+        value.retrySafe === false ||
+        value.stage === "unknown_send_state" ||
+        (generation &&
+          (typeof value.answer !== "string" || value.answer.trim().length === 0))
+      ) {
         const retrySafe = generation
           ? value.retrySafe === true
           : value.retrySafe !== false;
@@ -959,13 +966,18 @@ export const evaluateInRenderer = ({
               ? "client_not_found"
               : "unknown_send_state");
         const status = value.quotaRejected ? 429 : 502;
+        const rawErr =
+          typeof value.error === "string" ? value.error.trim() : "";
         fail(
-          new ChatGPTDesktopError(String(value.error), {
-            stage,
-            retrySafe,
-            status,
-            details: value,
-          }),
+          new ChatGPTDesktopError(
+            rawErr.length > 0 ? rawErr : "renderer 執行失敗",
+            {
+              stage,
+              retrySafe,
+              status,
+              details: value,
+            },
+          ),
         );
         return;
       }

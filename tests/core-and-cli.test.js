@@ -186,7 +186,22 @@ const startMockCdpServer = async (scenario = {}) => {
             `            }],`,
             `          };`,
             `        }`,
+            `        if (scenario.crossVersionOnlyInstant) {`,
+            `          return {`,
+            `            models: [{ slug: "gpt-5-3-instant", is_work_mode_model: false }],`,
+            `            versions: [{`,
+            `              enabled: true,`,
+            `              intelligence_presets: [`,
+            `                { model_slug: "gpt-5-3-thinking", lane: "thinking", preset_type: "available" },`,
+            `                { model_slug: "gpt-5-3-instant", lane: "instant", preset_type: "available" },`,
+            `              ],`,
+            `            }],`,
+            `          };`,
+            `        }`,
             `        return catalog;`,
+            `      }`,
+            `      if (scenario.throwEmptyErrorOnConversationGet) {`,
+            `        throw new Error("");`,
             `      }`,
             `      if (scenario.kind === "accepted-quota" || scenario.emptyConversation) {`,
             `        return { mapping: {} };`,
@@ -1135,6 +1150,57 @@ describe("Ticket 01 — CLI 入口 (--probe、退出碼 0/1/3、SIDECAR_WEB_RETR
         ]);
       } finally {
         mock.stop();
+      }
+
+      // 送出後若讀取對話拋出空訊息 Error("")，必須判為 unknown_send_state（CLI exit 3），不可誤判成功
+      const emptyErrMock = await startMockCdpServer({
+        kind: "success",
+        throwEmptyErrorOnConversationGet: true,
+      });
+      try {
+        let outEmpty = "";
+        let errEmpty = "";
+        const codeEmpty = await runCli([THINKING_MODEL], {
+          stdinText: "question",
+          cdpUrl: emptyErrMock.cdpUrl,
+          logPath,
+          writeStdout: (s) => {
+            outEmpty += s;
+          },
+          writeStderr: (s) => {
+            errEmpty += s;
+          },
+        });
+        expect(codeEmpty).toBe(3);
+        expect(outEmpty).toBe("");
+        expect(errEmpty).toContain("SIDECAR_WEB_RETRY_UNSAFE");
+        expect(emptyErrMock.state.requests.length).toBe(1);
+      } finally {
+        emptyErrMock.stop();
+      }
+
+      // 若目錄中僅其他版本有 Instant，不得跨版本降級送出
+      const crossVerMock = await startMockCdpServer({
+        kind: "quota",
+        crossVersionOnlyInstant: true,
+      });
+      try {
+        await expect(
+          sendConversation({
+            prompt: "test cross version",
+            model: THINKING_MODEL,
+            instantFallback: true,
+            cdpUrl: crossVerMock.cdpUrl,
+          }),
+        ).rejects.toMatchObject({
+          stage: "quota_exceeded",
+          retrySafe: true,
+        });
+        expect(crossVerMock.state.requests.map((r) => r.model)).toEqual([
+          THINKING_MODEL,
+        ]);
+      } finally {
+        crossVerMock.stop();
       }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
