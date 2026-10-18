@@ -5,11 +5,13 @@ import {
   ChatGPTDesktopError,
   DEFAULT_CDP_PORT,
   checkPortFree,
+  finishFallbackLog,
   formatMessagesToPrompt,
   listModels,
   parsePortFromCommandArgs,
   parsePortOrCdpInput,
   probeClient,
+  recordFallbackLog,
   resolveCdpPort,
   sendConversation,
 } from "./core.js";
@@ -561,6 +563,41 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 timeoutMs: pluginOptions?.chatTimeoutMs ?? 300000,
                 targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
                 signal: init?.signal,
+                onFallbackStart: ({ fallbackId, requestedModel }) => {
+                  try {
+                    recordFallbackLog("fallback_started", fallbackId, requestedModel, {
+                      reason_code: "model_cap_exceeded",
+                      fallback_mode: "Instant",
+                    });
+                  } catch {
+                    // 外掛宿主內紀錄寫入失敗不阻擋請求。
+                  }
+                },
+                onFallbackFailed: ({ fallbackId, requestedModel, error: fbErr }) => {
+                  finishFallbackLog(
+                    "fallback_failed",
+                    fallbackId,
+                    requestedModel,
+                    {
+                      retry_safe: Boolean(fbErr?.retrySafe),
+                      reason_code: fbErr?.details?.errorCode ?? null,
+                    },
+                    { writeStderr: () => {} },
+                  );
+                },
+                onFallbackComplete: ({ fallbackId, requestedModel, result: okRes }) => {
+                  finishFallbackLog(
+                    "fallback_completed",
+                    fallbackId,
+                    requestedModel,
+                    {
+                      sent_model: okRes.requestedModel,
+                      actual_model: okRes.model,
+                      conversation_id: okRes.conversationId,
+                    },
+                    { writeStderr: () => {} },
+                  );
+                },
               });
 
               const completionId = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
@@ -667,6 +704,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     headers: {
                       "content-type": "application/json",
                       "X-Should-Retry": "false",
+                      "Retry-After": "60",
                     },
                   },
                 );
@@ -683,7 +721,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   }),
                   {
                     status: 429,
-                    headers: { "content-type": "application/json" },
+                    headers: {
+                      "content-type": "application/json",
+                      "Retry-After": "60",
+                    },
                   },
                 );
               }
@@ -698,7 +739,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 }),
                 {
                   status: 503,
-                  headers: { "content-type": "application/json" },
+                  headers: {
+                    "content-type": "application/json",
+                    "Retry-After": "60",
+                  },
                 },
               );
             }
