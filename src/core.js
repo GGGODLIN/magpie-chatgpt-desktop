@@ -30,17 +30,21 @@ export class ChatGPTDesktopError extends Error {
   }
 }
 
+export const DEFAULT_CLIENT_EXPORTS = ["Ymr", "fTt"];
+
 export const preferredClientExports = (env = process.env) => {
   const preferred = [];
   const rawOverride = String(env?.CODEX_ADVISOR_CLIENT_EXPORT ?? "").trim();
-  const parts = rawOverride ? rawOverride.split(",") : [];
-  for (const part of [...parts, "fTt"]) {
+  const parts = rawOverride
+    ? rawOverride.split(",")
+    : DEFAULT_CLIENT_EXPORTS;
+  for (const part of parts) {
     const name = part.trim();
     if (name && !preferred.includes(name)) {
       preferred.push(name);
     }
   }
-  return preferred;
+  return preferred.length > 0 ? preferred : [...DEFAULT_CLIENT_EXPORTS];
 };
 
 export const parsePortFromCommandArgs = (commandLine) => {
@@ -122,7 +126,15 @@ export const isChatGPTAppCommand = (line) =>
     String(line ?? "").trim(),
   );
 
+let cachedPsLookup = { at: 0, port: null };
+const PS_CACHE_TTL_MS = 1500;
+
 export const detectRunningChatGPTPort = ({ execSyncImpl = execSync } = {}) => {
+  const useDefaultExec = execSyncImpl === execSync;
+  const now = Date.now();
+  if (useDefaultExec && now - cachedPsLookup.at < PS_CACHE_TTL_MS) {
+    return cachedPsLookup.port;
+  }
   try {
     const output = String(
       execSyncImpl("/bin/ps -ax -o command=", {
@@ -132,7 +144,11 @@ export const detectRunningChatGPTPort = ({ execSyncImpl = execSync } = {}) => {
       }),
     );
     const lines = output.split(/\r?\n/).filter(isChatGPTAppCommand);
-    return parsePortFromCommandArgs(lines);
+    const port = parsePortFromCommandArgs(lines);
+    if (useDefaultExec) {
+      cachedPsLookup = { at: Date.now(), port };
+    }
+    return port;
   } catch {
     return null;
   }
@@ -828,6 +844,7 @@ export const evaluateInRenderer = ({
 } = {}) =>
   new Promise((resolve, reject) => {
     let settled = false;
+    let wsOpened = false;
     let ws = null;
     let timer = null;
 
@@ -894,16 +911,21 @@ export const evaluateInRenderer = ({
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       fail(
         new ChatGPTDesktopError(`renderer ${seconds} 秒內沒有回應`, {
-          stage: generation ? "unknown_send_state" : "cdp_unreachable",
+          stage: generation
+            ? "unknown_send_state"
+            : wsOpened
+              ? "renderer_timeout"
+              : "cdp_unreachable",
           retrySafe: !generation,
           status: 502,
-          details: { timeoutMs },
+          details: { timeoutMs, wsOpened },
         }),
       );
     }, timeoutMs);
 
     attachWsListener(ws, "open", () => {
       if (settled) return;
+      wsOpened = true;
       try {
         ws.send(
           JSON.stringify({
@@ -1081,6 +1103,9 @@ export const normalizeCatalogModels = (catalog) => {
   return normalized;
 };
 
+const inFlightProbes = new Map();
+const inFlightModels = new Map();
+
 export const probeClient = async ({
   cdpUrl,
   configuredPort,
@@ -1102,26 +1127,44 @@ export const probeClient = async ({
         detectRunningPort,
         forLaunch: false,
       });
-  const target = await getRendererTarget({
-    cdpUrl: resolvedCdp.cdpUrl,
-    fetchImpl,
-    timeoutMs: targetTimeoutMs,
-  });
   const preferred = preferredClientExports(env);
-  const result = await evaluateInRenderer({
-    wsUrl: target.webSocketDebuggerUrl,
-    expression: buildProbeExpression(preferred),
-    timeoutMs,
-    signal,
-    generation: false,
-    WebSocketImpl,
-  });
-  return {
-    ...result,
-    ok: true,
-    preferred,
-    drifted: result.clientExport !== preferred[0],
-  };
+  const canDedupe = !signal && !fetchImpl && !WebSocketImpl;
+  const dedupeKey = `${resolvedCdp.cdpUrl}|${preferred.join(",")}`;
+  if (canDedupe && inFlightProbes.has(dedupeKey)) {
+    const shared = await inFlightProbes.get(dedupeKey);
+    return structuredClone(shared);
+  }
+  const run = (async () => {
+    const target = await getRendererTarget({
+      cdpUrl: resolvedCdp.cdpUrl,
+      fetchImpl,
+      timeoutMs: targetTimeoutMs,
+    });
+    const result = await evaluateInRenderer({
+      wsUrl: target.webSocketDebuggerUrl,
+      expression: buildProbeExpression(preferred),
+      timeoutMs,
+      signal,
+      generation: false,
+      WebSocketImpl,
+    });
+    return {
+      ...result,
+      ok: true,
+      preferred,
+      drifted: result.clientExport !== preferred[0],
+    };
+  })();
+  if (!canDedupe) {
+    return run;
+  }
+  inFlightProbes.set(dedupeKey, run);
+  try {
+    const out = await run;
+    return structuredClone(out);
+  } finally {
+    inFlightProbes.delete(dedupeKey);
+  }
 };
 
 export const listModels = async ({
@@ -1145,26 +1188,44 @@ export const listModels = async ({
         detectRunningPort,
         forLaunch: false,
       });
-  const target = await getRendererTarget({
-    cdpUrl: resolvedCdp.cdpUrl,
-    fetchImpl,
-    timeoutMs: targetTimeoutMs,
-  });
   const preferred = preferredClientExports(env);
-  const result = await evaluateInRenderer({
-    wsUrl: target.webSocketDebuggerUrl,
-    expression: buildModelsExpression(preferred),
-    timeoutMs,
-    signal,
-    generation: false,
-    WebSocketImpl,
-  });
-  return {
-    models: normalizeCatalogModels(result.catalog),
-    catalog: result.catalog ?? { models: [], versions: [] },
-    clientExport: result.clientExport ?? null,
-    moduleUrl: result.moduleUrl ?? null,
-  };
+  const canDedupe = !signal && !fetchImpl && !WebSocketImpl;
+  const dedupeKey = `${resolvedCdp.cdpUrl}|${preferred.join(",")}`;
+  if (canDedupe && inFlightModels.has(dedupeKey)) {
+    const shared = await inFlightModels.get(dedupeKey);
+    return structuredClone(shared);
+  }
+  const run = (async () => {
+    const target = await getRendererTarget({
+      cdpUrl: resolvedCdp.cdpUrl,
+      fetchImpl,
+      timeoutMs: targetTimeoutMs,
+    });
+    const result = await evaluateInRenderer({
+      wsUrl: target.webSocketDebuggerUrl,
+      expression: buildModelsExpression(preferred),
+      timeoutMs,
+      signal,
+      generation: false,
+      WebSocketImpl,
+    });
+    return {
+      models: normalizeCatalogModels(result.catalog),
+      catalog: result.catalog ?? { models: [], versions: [] },
+      clientExport: result.clientExport ?? null,
+      moduleUrl: result.moduleUrl ?? null,
+    };
+  })();
+  if (!canDedupe) {
+    return run;
+  }
+  inFlightModels.set(dedupeKey, run);
+  try {
+    const out = await run;
+    return structuredClone(out);
+  } finally {
+    inFlightModels.delete(dedupeKey);
+  }
 };
 
 export const sendConversation = async ({

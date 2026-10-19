@@ -29,6 +29,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
     switch (error?.stage) {
       case "cdp_unreachable":
         return "ChatGPT Desktop 除錯埠未回應（CDP unreachable）。請在 Magpie 點選「Sign in」啟動或重開 ChatGPT.app。";
+      case "renderer_timeout":
+        return "ChatGPT Desktop 內部畫面查詢逾時（Renderer evaluation timed out）。請確認網路連線正常並稍後再試。";
       case "renderer_not_unique":
         return "ChatGPT Desktop 主視窗數量異常（Main renderer window is not unique）。請確認 ChatGPT.app 已開啟且僅保留一個主視窗。";
       case "module_not_found":
@@ -309,8 +311,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           const cdpUrl = await resolveActiveCdpUrl(ctx?.auth);
           const { models } = await listModels({
             cdpUrl,
-            timeoutMs: pluginOptions?.modelsTimeoutMs ?? 5000,
-            targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 2000,
+            timeoutMs: pluginOptions?.modelsTimeoutMs ?? 12000,
+            targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
           });
           const out = {};
           for (const m of models) {
@@ -468,8 +470,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           const cdpUrl = await resolveActiveCdpUrl(auth);
           const probe = await probeClient({
             cdpUrl,
-            timeoutMs: pluginOptions?.probeTimeoutMs ?? 5000,
-            targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 2000,
+            timeoutMs: pluginOptions?.probeTimeoutMs ?? 12000,
+            targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
           });
           if (!probe.challengeOk) {
             return {

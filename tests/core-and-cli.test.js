@@ -595,6 +595,47 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       mock.stop();
     }
   });
+
+  test("preferredClientExports 預設優先 Ymr/fTt，併發 listModels/probeClient 自動合併單一評估，且 WebSocket 已連線後的評估逾時標記為 renderer_timeout", async () => {
+    expect(preferredClientExports({})).toEqual(["Ymr", "fTt"]);
+    expect(preferredClientExports({ CODEX_ADVISOR_CLIENT_EXPORT: "fTt" })).toEqual([
+      "fTt",
+    ]);
+
+    const mock = await startMockCdpServer({
+      kind: "success",
+      exportName: "Ymr",
+    });
+    try {
+      const batch = await Promise.all(
+        Array.from({ length: 8 }, () => listModels({ cdpUrl: mock.cdpUrl })),
+      );
+      expect(mock.state.evaluateCount).toBe(1);
+      for (const item of batch) {
+        expect(item.models.length).toBe(3);
+        expect(item.clientExport).toBe("Ymr");
+      }
+      batch[0].models[0].name = "mutated";
+      expect(batch[1].models[0].name).not.toBe("mutated");
+    } finally {
+      mock.stop();
+    }
+
+    const hangMock = await startMockCdpServer({ hangForever: true });
+    try {
+      let caught = null;
+      try {
+        await listModels({ cdpUrl: hangMock.cdpUrl, timeoutMs: 80 });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ChatGPTDesktopError);
+      expect(caught.stage).toBe("renderer_timeout");
+      expect(caught.details.wsOpened).toBe(true);
+    } finally {
+      hangMock.stop();
+    }
+  });
 });
 
 describe("Ticket 01 — 多輪對話與系統提示折疊、非文字附件送出前拒絕", () => {
