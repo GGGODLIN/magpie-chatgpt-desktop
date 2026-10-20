@@ -582,11 +582,14 @@ ${buildResolverJs(preferredExports)}
     // 所以背景流量自己記數、到預算就停，留餘量給本人。存 localStorage 才撐得過外掛重啟與 App 重開。
     const DAY_MS = 24 * 60 * 60 * 1000;
     let sends = [];
+    let storedBudget = null;
     try {
       sends = JSON.parse(localStorage.getItem("magpieSendTimes") ?? "[]")
         .filter((at) => typeof at === "number" && Date.now() - at < DAY_MS);
+      const raw = Number(localStorage.getItem("magpieDailyBudget"));
+      if (Number.isFinite(raw) && raw > 0) storedBudget = raw;
     } catch {}
-    const dailyBudget = globalThis.__magpieDailyBudget ?? options.dailyBudget ?? null;
+    const dailyBudget = globalThis.__magpieDailyBudget ?? storedBudget ?? options.dailyBudget ?? null;
     if (typeof dailyBudget === "number" && sends.length >= dailyBudget) {
       return {
         error: "ChatGPT Desktop 已用完 24 小時預算（" + sends.length + "/" + dailyBudget + "，rate_limit_exceeded）",
