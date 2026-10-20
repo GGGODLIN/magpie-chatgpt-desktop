@@ -10,6 +10,13 @@ export const HIGH_PORT_MIN = 58000;
 export const HIGH_PORT_MAX = 65000;
 export const RENDERER_URL = "app://-/index.html";
 export const MAX_PROMPT_BYTES = 500000;
+export const UNUSUAL_ACTIVITY_COOLDOWN_MS = 15 * 60 * 1000;
+
+let unusualActivityUntil = 0;
+
+export const resetUnusualActivityCooldown = () => {
+  unusualActivityUntil = 0;
+};
 
 export const estimateTokenCount = (text) => {
   const str = String(text ?? "");
@@ -654,7 +661,7 @@ ${buildResolverJs(preferredExports)}
       return {
         error: "ChatGPT Desktop 觸發短暫異常流量保護（rate_limit_exceeded: unusual activity），請稍後再試",
         stage: "rate_limited",
-        retrySafe: false,
+        retrySafe: true,
         outcome,
       };
     }
@@ -1400,6 +1407,17 @@ export const sendConversation = async ({
   // 送出前先驗證與折疊訊息；若含圖片、音訊或非文字附件，直接拋出 400 且不發起任何遠端連線。
   const formattedPrompt = formatMessagesToPrompt(messages ?? prompt);
 
+  if (Date.now() < unusualActivityUntil) {
+    throw new ChatGPTDesktopError(
+      "ChatGPT Desktop 觸發短暫異常流量保護冷卻中（rate_limit_exceeded: unusual activity），請稍後再試",
+      {
+        stage: "rate_limited",
+        retrySafe: true,
+        status: 429,
+      },
+    );
+  }
+
   const resolvedCdp = cdpUrl
     ? { cdpUrl }
     : await resolveCdpPort({
@@ -1441,6 +1459,9 @@ export const sendConversation = async ({
   try {
     result = await sendOnce(false);
   } catch (error) {
+    if (error?.stage === "rate_limited") {
+      unusualActivityUntil = Date.now() + UNUSUAL_ACTIVITY_COOLDOWN_MS;
+    }
     const details = error?.details ?? {};
     const eligibleModel = allowProFallback
       ? true

@@ -739,7 +739,6 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     status: 429,
                     headers: {
                       "content-type": "application/json",
-                      "X-Should-Retry": "false",
                       "Retry-After": "900",
                     },
                   },
