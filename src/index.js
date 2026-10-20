@@ -49,8 +49,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           .replace("T", " ");
         return `ChatGPT Desktop 模型配額已滿（Quota exceeded: model_cap_exceeded, resets at ${resetIso} UTC+0, please switch to the other models）。如需自動退回 Instant 模型，請開啟供應商設定的「instant_fallback」開關。`;
       }
-      case "rate_limited":
-        return "ChatGPT Desktop 拒收請求、暫停 3 分鐘（Rate limit exceeded: rejected before conversation, try again in 3m）。";
+      case "rate_limited": {
+        const waitMin = Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 180000) / 60000));
+        return `ChatGPT Desktop 暫時不收請求、約 ${waitMin} 分鐘後再試（Rate limit exceeded, try again in ${waitMin}m）。`;
+      }
       case "unknown_send_state":
         return "ChatGPT Desktop 對話請求已送出但連線中斷或未確認完成狀態（Unknown send state）；為避免重複扣額，請勿自動重送。";
       default:
@@ -580,6 +582,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 allowProFallback: true,
                 timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
                 targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
+                dailyBudget: pluginOptions?.dailyBudget ?? null,
                 signal: init?.signal,
                 onFallbackStart: ({ fallbackId, requestedModel }) => {
                   try {

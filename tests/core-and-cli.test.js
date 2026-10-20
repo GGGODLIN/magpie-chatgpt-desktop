@@ -260,6 +260,13 @@ const startMockCdpServer = async (scenario = {}) => {
             `        },`,
             `      };`,
             `    },`,
+            `    safePost: async (path) => {`,
+            `      globalThis.__testReads.push("POST " + path);`,
+            `      if (path === "/conversation/init" && scenario.sendBlockedUntil) {`,
+            `        return { blocked_features: [{ name: "send", resets_after: scenario.sendBlockedUntil }] };`,
+            `      }`,
+            `      return {};`,
+            `    },`,
             `    streamPost: (_path, init) => {`,
             `      const body = JSON.parse(init.body);`,
             `      globalThis.__testRequests.push(body);`,
@@ -288,6 +295,8 @@ const startMockCdpServer = async (scenario = {}) => {
             `        init.onError({ type: "fetch-stream-error", error: JSON.stringify({ error: "Our systems have detected unusual activity coming from your system. Please try again later." }), responseStatus: 200, failureOrigin: "server_stream" });`,
             `      } else if (scenario.kind === "rejected") {`,
             `        init.onError({ type: "fetch-stream-error", error: JSON.stringify({ detail: "Unusual activity has been detected from your device. Try again later." }), responseStatus: 403 });`,
+            `      } else if (scenario.kind === "daily-cap") {`,
+            `        init.onError({ type: "fetch-stream-error", error: JSON.stringify({ detail: "You've reached our limit of messages per 24 hours. Please try again later." }), responseStatus: 429 });`,
             `      } else if (scenario.kind === "rate") {`,
             `        init.onError({ status: 429, error: { code: "rate_limit_exceeded" } });`,
             `      } else if (scenario.kind === "conflicting-code") {`,
@@ -850,6 +859,61 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(remaining).toBeGreaterThan(170 * 1000);
       expect(remaining).toBeLessThanOrEqual(180 * 1000);
     } finally {
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("24 小時上限把 send 鎖住時，照 conversation/init 給的解鎖時間冷卻", async () => {
+    const resetsAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString();
+    const mock = await startMockCdpServer({ kind: "daily-cap", sendBlockedUntil: resetsAt });
+    try {
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(mock.state.reads).toContain("POST /conversation/init");
+      const remaining = globalThis.__magpieUnusualActivityUntil - Date.now();
+      expect(remaining).toBeGreaterThan(6.9 * 60 * 60 * 1000);
+      expect(err?.details?.retryAfterMs).toBeGreaterThan(6.9 * 60 * 60 * 1000);
+    } finally {
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("24 小時內送出次數到預算就不送，並記下每次送出", async () => {
+    const mock = await startMockCdpServer({ kind: "success" });
+    const store = new Map();
+    const hadStorage = "localStorage" in globalThis;
+    const previous = globalThis.localStorage;
+    globalThis.localStorage = {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
+    };
+    try {
+      const old = Date.now() - 25 * 60 * 60 * 1000;
+      const recent = Date.now() - 60 * 60 * 1000;
+      store.set("magpieSendTimes", JSON.stringify([old, recent]));
+      await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", dailyBudget: 2 });
+      expect(JSON.parse(store.get("magpieSendTimes")).length).toBe(2);
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", dailyBudget: 2 });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(mock.state.requests.length).toBe(1);
+      expect(err?.details?.retryAfterMs).toBeGreaterThan(22.9 * 60 * 60 * 1000);
+    } finally {
+      if (hadStorage) globalThis.localStorage = previous;
+      else delete globalThis.localStorage;
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();
       mock.stop();

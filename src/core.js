@@ -578,6 +578,28 @@ ${buildResolverJs(preferredExports)}
       };
     }
 
+    // 帳號 24 小時訊息上限是 send 整個被鎖（2026-10-21 約 800～1,080 則後鎖 7 小時，使用者自己的 ChatGPT 也不能用），
+    // 所以背景流量自己記數、到預算就停，留餘量給本人。存 localStorage 才撐得過外掛重啟與 App 重開。
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    let sends = [];
+    try {
+      sends = JSON.parse(localStorage.getItem("magpieSendTimes") ?? "[]")
+        .filter((at) => typeof at === "number" && Date.now() - at < DAY_MS);
+    } catch {}
+    const dailyBudget = globalThis.__magpieDailyBudget ?? options.dailyBudget ?? null;
+    if (typeof dailyBudget === "number" && sends.length >= dailyBudget) {
+      return {
+        error: "ChatGPT Desktop 已用完 24 小時預算（" + sends.length + "/" + dailyBudget + "，rate_limit_exceeded）",
+        stage: "rate_limited",
+        retrySafe: true,
+        outcome: "daily_budget",
+        retryAfterMs: Math.max(60000, sends[sends.length - dailyBudget] + DAY_MS - Date.now()),
+      };
+    }
+    try {
+      localStorage.setItem("magpieSendTimes", JSON.stringify([...sends, Date.now()]));
+    } catch {}
+
     const outcome = await new Promise((resolve) => {
       let settled = false;
       const done = (why) => { if (!settled) { settled = true; resolve(why); } };
@@ -722,13 +744,34 @@ ${buildResolverJs(preferredExports)}
       !assistantSeen &&
       [403, 429].includes(errorObject?.responseStatus);
     if (rejectedBeforeConversation) {
-      globalThis.__magpieUnusualActivityUntil = Date.now() + 3 * 60 * 1000;
+      // 2026-10-21 實測 24 小時訊息上限是整個帳號的 send 被鎖，所有模型一起停、7 小時後才解；
+      // 每 3 分鐘重試只會一直撞牆。App 自己用 /conversation/init 的 blocked_features 取得解鎖時間，照它冷卻。
+      let until = Date.now() + 3 * 60 * 1000;
+      if (errorObject?.responseStatus === 429) {
+        try {
+          const init = await client.safePost("/conversation/init", {
+            requestBody: {
+              conversation_id: null,
+              conversation_origin: null,
+              gizmo_id: null,
+              requested_default_model: requestModel,
+              system_hints: null,
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              timezone_offset_min: new Date().getTimezoneOffset(),
+            },
+          });
+          const send = (init?.blocked_features ?? []).find((feature) => feature?.name === "send");
+          const resetsAt = Date.parse(send?.resets_after ?? "");
+          if (Number.isFinite(resetsAt) && resetsAt > until) until = resetsAt;
+        } catch {}
+      }
+      globalThis.__magpieUnusualActivityUntil = until;
       return {
         error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
         stage: "rate_limited",
         retrySafe: true,
         outcome,
-        retryAfterMs: 3 * 60 * 1000,
+        retryAfterMs: until - Date.now(),
       };
     }
     const recoverable = outcome !== "complete" && errorCode === null;
@@ -1578,6 +1621,7 @@ export const sendConversation = async ({
   WebSocketImpl,
   timeoutMs = 420000,
   targetTimeoutMs = 4000,
+  dailyBudget = null,
   signal,
 } = {}) => {
   const selectedModel = typeof model === "string" ? model.trim() : "";
@@ -1630,6 +1674,7 @@ export const sendConversation = async ({
         // 背景群組的答案常要 60～150 秒才寫完（2026-10-20 實測 90 秒截掉多筆 in_progress），預設 210 秒；
         // 仍留時間給撈不到時 Magpie 換備援，不讓整段先撞 claude-mem 的 300 秒。
         recoverWithinMs: Math.max(0, Math.min(210000, timeoutMs - 120000)),
+        dailyBudget,
       },
       preferred,
     );
