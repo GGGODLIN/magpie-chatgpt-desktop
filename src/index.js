@@ -739,7 +739,9 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     status: 429,
                     headers: {
                       "content-type": "application/json",
-                      "Retry-After": "180",
+                      "Retry-After": String(
+                        Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 180000) / 1000)),
+                      ),
                     },
                   },
                 );

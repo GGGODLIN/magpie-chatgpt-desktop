@@ -508,14 +508,18 @@ export const buildChatExpression = (
     effort: normalizeThinkingEffort(options?.effort, options?.model),
   };
   return `(async () => {
-  if ((globalThis.__magpieUnusualActivityUntil ?? 0) > Date.now()) {
+  const coolingDown = () => {
+    const waitMs = (globalThis.__magpieUnusualActivityUntil ?? 0) - Date.now();
+    if (waitMs <= 0) return null;
     return {
-      error: "ChatGPT Desktop 拒收後冷卻中（rate_limit_exceeded），請稍後再試",
+      error: "ChatGPT Desktop 送出間隔冷卻中（rate_limit_exceeded），請稍後再試",
       stage: "rate_limited",
       retrySafe: true,
       outcome: "cooldown",
+      retryAfterMs: waitMs,
     };
-  }
+  };
+  if (coolingDown()) return coolingDown();
   const options = ${JSON.stringify(normalizedOptions)};
   const events = [];
   let sendAttempted = false;
@@ -574,6 +578,15 @@ ${buildResolverJs(preferredExports)}
       app_attest_challenge: challenge,
     };
     if (!options.instantFallback && options.effort) body.thinking_effort = options.effort;
+
+    // 被標記期間，兩筆 POST 間隔太近（實測 6～41 秒）就會被 403 直接拒收；
+    // 檢查與登記之間沒有 await，同時進來的請求不會一起通過。
+    const blocked = coolingDown();
+    if (blocked) return blocked;
+    const postedAt = Date.now();
+    const minPostGapMs = options.minPostGapMs ?? 60000;
+    const flaggedRecently = postedAt - (globalThis.__magpieFlaggedAt ?? 0) < 60 * 60 * 1000;
+    if (flaggedRecently) globalThis.__magpieUnusualActivityUntil = postedAt + minPostGapMs;
 
     const outcome = await new Promise((resolve) => {
       let settled = false;
@@ -700,15 +713,24 @@ ${buildResolverJs(preferredExports)}
       [403, 429].includes(errorObject?.responseStatus);
     if (rejectedBeforeConversation) {
       globalThis.__magpieAttestedCache = null;
+      globalThis.__magpieFlaggedAt = Date.now();
       globalThis.__magpieUnusualActivityUntil = Date.now() + 3 * 60 * 1000;
       return {
         error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
         stage: "rate_limited",
         retrySafe: true,
         outcome,
+        retryAfterMs: 3 * 60 * 1000,
       };
     }
     const recoverable = outcome !== "complete" && errorCode === null;
+    if (recoverable && conversationId) {
+      globalThis.__magpieFlaggedAt = Date.now();
+      globalThis.__magpieUnusualActivityUntil = Math.max(
+        globalThis.__magpieUnusualActivityUntil ?? 0,
+        postedAt + minPostGapMs,
+      );
+    }
     if (!conversationId) {
       return {
         error: "串流沒有確認送出狀態",
@@ -1498,11 +1520,12 @@ export const sendConversation = async ({
 
   if (Date.now() < unusualActivityUntil) {
     throw new ChatGPTDesktopError(
-      "ChatGPT Desktop 拒收後冷卻中（rate_limit_exceeded），請稍後再試",
+      "ChatGPT Desktop 送出間隔冷卻中（rate_limit_exceeded），請稍後再試",
       {
         stage: "rate_limited",
         retrySafe: true,
         status: 429,
+        details: { retryAfterMs: unusualActivityUntil - Date.now() },
       },
     );
   }
@@ -1551,7 +1574,7 @@ export const sendConversation = async ({
     result = await sendOnce(false);
   } catch (error) {
     if (error?.stage === "rate_limited") {
-      unusualActivityUntil = Date.now() + UNUSUAL_ACTIVITY_COOLDOWN_MS;
+      unusualActivityUntil = Date.now() + (error?.details?.retryAfterMs ?? UNUSUAL_ACTIVITY_COOLDOWN_MS);
     }
     const details = error?.details ?? {};
     const eligibleModel = allowProFallback
