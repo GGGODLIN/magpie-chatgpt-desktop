@@ -518,7 +518,7 @@ ${buildResolverJs(preferredExports)}
         weight: 1,
       }],
       model: requestModel,
-      supported_encodings: ["v1"],
+      supported_encodings: [],
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       timezone_offset_min: new Date().getTimezoneOffset(),
       client_prepare_state: "none",
@@ -605,26 +605,79 @@ ${buildResolverJs(preferredExports)}
       };
     }
 
-    const conversation = await client.safeGet(
-      \`/conversation/\${encodeURIComponent(conversationId)}\`,
-      {},
-    );
-    const mapping = conversation?.mapping ?? {};
+    // 關閉 v1 delta 編碼後，/f/conversation 的 SSE 事件已直接攜帶 finished_successfully 的完稿 message；
+    // 先從串流事件取答案可省去每回合結尾的 GET /conversation/{id}，避免高併發觸發讀取限流。
+    // 同时剝除 GPT-6 model_dil_v2 對純 JSON/XML 外層包裹的 <escape>...</escape>。
+    const unwrapDilEscape = (raw) => {
+      const trimmed = String(raw ?? "").trim();
+      if (trimmed.startsWith("<escape>") && trimmed.endsWith("</escape>")) {
+        return trimmed.slice(8, -9).trim();
+      }
+      return trimmed;
+    };
     let best = null;
-    for (const node of Object.values(mapping)) {
-      const message = node?.message;
-      if (message?.author?.role !== "assistant") continue;
-      if (message?.status !== "finished_successfully") continue;
+    const considerMessage = (message) => {
+      if (message?.author?.role !== "assistant") return;
+      if (message?.status !== "finished_successfully") return;
+      if (message?.recipient && message.recipient !== "all") return;
+      if (message?.channel && message.channel !== "final") return;
       const content = message.content;
       const contentType = content?.content_type ?? content?.contentType;
-      if (["thought", "reasoning"].includes(contentType)) continue;
-      const text = Array.isArray(content?.parts)
-        ? content.parts.map((part) => typeof part === "string" ? part : (part?.text ?? "")).join("").trim()
-        : (typeof content?.text === "string" ? content.text.trim() : "");
-      if (!text) continue;
+      if (
+        [
+          "thought",
+          "thoughts",
+          "reasoning",
+          "reasoning_recap",
+          "model_editable_context",
+          "code",
+          "execution_output",
+        ].includes(contentType)
+      ) {
+        return;
+      }
+      const rawText = Array.isArray(content?.parts)
+        ? content.parts
+            .map((part) => (typeof part === "string" ? part : (part?.text ?? "")))
+            .join("")
+            .trim()
+        : typeof content?.text === "string"
+          ? content.text.trim()
+          : "";
+      const text = unwrapDilEscape(rawText);
+      if (!text) return;
       const at = message.create_time ?? 0;
       if (best === null || at >= best.at) {
-        best = { at, text, model: message?.metadata?.model_slug ?? null };
+        best = {
+          at,
+          text,
+          model:
+            message?.metadata?.model_slug ??
+            message?.metadata?.resolved_model_slug ??
+            null,
+        };
+      }
+    };
+    if (outcome === "complete") {
+      for (const rawEv of events) {
+        let ev = rawEv;
+        if (typeof ev === "string") {
+          try { ev = JSON.parse(ev); } catch { ev = null; }
+        }
+        const msgCandidate =
+          ev?.data?.message ?? ev?.data?.v?.message ?? ev?.message ?? null;
+        if (msgCandidate) considerMessage(msgCandidate);
+      }
+    }
+    if (outcome !== "complete" || best === null) {
+      const conversation = await client.safeGet(
+        \`/conversation/\${encodeURIComponent(conversationId)}\`,
+        {},
+      );
+      const mapping = conversation?.mapping ?? {};
+      best = null;
+      for (const node of Object.values(mapping)) {
+        considerMessage(node?.message);
       }
     }
     if (best === null) {

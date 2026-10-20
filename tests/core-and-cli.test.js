@@ -254,7 +254,24 @@ const startMockCdpServer = async (scenario = {}) => {
             `      const body = JSON.parse(init.body);`,
             `      globalThis.__testRequests.push(body);`,
             `      const quota = { detail: { code: "model_cap_exceeded", message: "Allowance exhausted" } };`,
-            `      if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {`,
+            `      if (scenario.kind === "stream-complete") {`,
+            `        init.onEvent({`,
+            `          type: "fetch-stream-event",`,
+            `          data: {`,
+            `            conversation_id: "conv-stream-456",`,
+            `            message: {`,
+            `              author: { role: "assistant" },`,
+            `              status: "finished_successfully",`,
+            `              channel: "final",`,
+            `              recipient: "all",`,
+            `              content: { content_type: "text", parts: [answer] },`,
+            `              create_time: 500,`,
+            `              metadata: { model_slug: body.model },`,
+            `            },`,
+            `          },`,
+            `        });`,
+            `        init.onComplete({ conversation_id: "conv-stream-456" });`,
+            `      } else if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {`,
             `        init.onComplete({ conversation_id: "conv-123" });`,
             `      } else if (scenario.kind === "rate") {`,
             `        init.onError({ status: 429, error: { code: "rate_limit_exceeded" } });`,
@@ -576,6 +593,28 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(chat.answer).not.toContain("internal reasoning");
       expect(chat.answer).not.toContain("unfinished draft");
       expect(chat.clientExport).toBe("fallbackInitClient");
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("串流事件已含完成訊息時直接取答案（不發送 GET /conversation/{id}），並自動剝除 model_dil_v2 外層 <escape> 標籤", async () => {
+    const mock = await startMockCdpServer({
+      kind: "stream-complete",
+      throwEmptyErrorOnConversationGet: true,
+      answer: '<escape>{"findings":[]}</escape>',
+    });
+    try {
+      const chat = await sendConversation({
+        cdpUrl: mock.cdpUrl,
+        prompt: "Return raw JSON",
+        model: "gpt-6-thinking",
+        effort: "high",
+      });
+      expect(chat.answer).toBe('{"findings":[]}');
+      expect(chat.conversationId).toBe("conv-stream-456");
+      expect(mock.state.requests[0].supported_encodings).toEqual([]);
+      expect(mock.state.reads).toEqual(["/ios/attestation_challenge"]);
     } finally {
       mock.stop();
     }
