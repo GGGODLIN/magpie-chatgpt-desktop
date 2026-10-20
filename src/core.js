@@ -787,7 +787,10 @@ ${buildResolverJs(preferredExports)}
     };
     if (recoverable) {
       if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0);
-      if ((globalThis.__magpieRecovering ?? 0) >= 1) return giveUp("已有一筆在撈答案", 0);
+      // 同時撈答案的上限與讀取被拒後的暫停長度可在 renderer 直接調，方便實驗不用重新部署。
+      if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 1)) {
+        return giveUp("撈答案名額已滿", 0);
+      }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
       const waits = [5000, 10000, 15000, 20000];
       const startedAt = Date.now();
@@ -830,7 +833,7 @@ ${buildResolverJs(preferredExports)}
       }
       if (best === null) {
         return readRejected
-          ? giveUp("讀取被拒", 10 * 60 * 1000)
+          ? giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000)
           : giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
       }
     }
