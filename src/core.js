@@ -568,7 +568,7 @@ ${buildResolverJs(preferredExports)}
     // 被標記期間每筆送出都會在串流中途被插錯、只能靠撈答案；撈答案名額滿時再送只會白白生成一則
     // 沒人收的回答（2026-10-20 23:55 三分鐘內 17 筆這樣被丟掉），所以名額滿就不送。
     const flaggedRecently = Date.now() - (globalThis.__magpieSoftFlagAt ?? 0) < 10 * 60 * 1000;
-    if (flaggedRecently && (globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 1)) {
+    if (flaggedRecently && (globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 2)) {
       return {
         error: "ChatGPT Desktop 撈答案名額已滿，暫不送出（rate_limit_exceeded）",
         stage: "rate_limited",
@@ -869,7 +869,8 @@ ${buildResolverJs(preferredExports)}
       globalThis.__magpieSoftFlagAt = Date.now();
       if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0);
       // 同時撈答案的上限與讀取被拒後的暫停長度可在 renderer 直接調，方便實驗不用重新部署。
-      if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 1)) {
+      // 預設 2：2026-10-21 模擬同時 2 筆 30 分鐘 44/45 成功、GET 0 次被拒；同時 3 筆 20 分鐘就撞到 24 小時上限。
+      if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 2)) {
         return giveUp("撈答案名額已滿", 0);
       }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;

@@ -757,7 +757,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     const mock = await startMockCdpServer({ kind: "unusual" });
     try {
       globalThis.__magpieSoftFlagAt = Date.now();
-      globalThis.__magpieRecovering = 1;
+      globalThis.__magpieRecovering = 2;
       let err = null;
       try {
         await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
