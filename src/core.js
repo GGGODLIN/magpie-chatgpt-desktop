@@ -374,18 +374,8 @@ export const buildResolverJs = (
   const attestedClient = async () => {
     const { appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
     if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
-    const cacheKey = \`\${primaryUrl}|\${preferredClientExports.join(",")}\`;
-    const cached = globalThis.__magpieAttestedCache;
-    // 實驗：被標記期間的 403「from your device」都出現在沿用快取 challenge 的請求上，暫時每筆都拿新 challenge。
-    if (
-      globalThis.__magpieAttestCacheOff !== true &&
-      cached &&
-      cached.cacheKey === cacheKey &&
-      cached.expiresAt > Date.now() &&
-      cached.resolved?.client
-    ) {
-      return cached.resolved;
-    }
+    // 每筆都拿新 challenge、不快取：2026-10-20 被標記期間沿用快取 challenge 的請求幾秒內就被
+    // 403「Unusual activity has been detected from your device」拒收；改成每筆新拿後 17 筆 0 拒收。
     const attestationProbe = (candidate) =>
       candidate.safeGet("/ios/attestation_challenge", {
         additionalHeaders: { "X-OpenAI-Attach-DeviceCheck-Token": "1" },
@@ -405,16 +395,7 @@ export const buildResolverJs = (
         moduleUrl,
       };
     }
-    const out = { ...resolved, moduleUrl };
-    const expireAfterSec = Number(resolved.probeValue?.expire_after ?? 0);
-    if (Number.isFinite(expireAfterSec) && expireAfterSec > 60) {
-      globalThis.__magpieAttestedCache = {
-        cacheKey,
-        expiresAt: Date.now() + Math.min(expireAfterSec - 60, 480) * 1000,
-        resolved: out,
-      };
-    }
-    return out;
+    return { ...resolved, moduleUrl };
   };
 `;
 
@@ -709,7 +690,6 @@ ${buildResolverJs(preferredExports)}
       !assistantSeen &&
       [403, 429].includes(errorObject?.responseStatus);
     if (rejectedBeforeConversation) {
-      globalThis.__magpieAttestedCache = null;
       globalThis.__magpieUnusualActivityUntil = Date.now() + 3 * 60 * 1000;
       return {
         error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
