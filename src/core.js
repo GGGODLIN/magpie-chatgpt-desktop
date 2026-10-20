@@ -650,6 +650,7 @@ ${buildResolverJs(preferredExports)}
         eventCount: events.length,
         eventShapes: events.slice(0, 40).map(describe),
         streamError: (errorText ?? "").slice(0, 4000),
+        recoverWithinMs: options.recoverWithinMs ?? null,
       };
       globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-20);
     }
@@ -1504,6 +1505,7 @@ export const sendConversation = async ({
   WebSocketImpl,
   timeoutMs = 420000,
   targetTimeoutMs = 4000,
+  recoverWithinMs,
   signal,
 } = {}) => {
   const selectedModel = typeof model === "string" ? model.trim() : "";
@@ -1553,8 +1555,9 @@ export const sendConversation = async ({
         model: selectedModel,
         effort,
         instantFallback: useInstantFallback,
-        // 留 2 分鐘給撈不到答案時 Magpie 換備援，不讓整段先撞外層逾時；控制列直連只等 300 秒，上限壓在 90 秒。
-        recoverWithinMs: Math.max(0, Math.min(90000, timeoutMs - 120000)),
+        // 背景群組的答案常要 60～150 秒才寫完（2026-10-20 實測 90 秒截掉多筆 in_progress），預設 210 秒；
+        // 仍留時間給撈不到時 Magpie 換備援，不讓整段先撞 claude-mem 的 300 秒。
+        recoverWithinMs: Math.max(0, Math.min(recoverWithinMs ?? 210000, timeoutMs - 120000)),
       },
       preferred,
     );
