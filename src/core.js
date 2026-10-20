@@ -793,7 +793,9 @@ ${buildResolverJs(preferredExports)}
         return giveUp("撈答案名額已滿", 0);
       }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
-      const waits = [5000, 10000, 15000, 20000];
+      // 2026-10-20 實測讀取額度約 6 分半內 23 次就被限流，而長回答常要 60～150 秒才寫完；
+      // 少讀幾次比早讀到重要，預設第 20 秒讀第一次、之後每 30 秒。
+      const waits = globalThis.__magpieReadWaits ?? [20000, 30000];
       const startedAt = Date.now();
       const deadline = startedAt + (options.recoverWithinMs ?? 90000);
       const readLog = [];
