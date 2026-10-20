@@ -508,6 +508,14 @@ export const buildChatExpression = (
     effort: normalizeThinkingEffort(options?.effort, options?.model),
   };
   return `(async () => {
+  if ((globalThis.__magpieUnusualActivityUntil ?? 0) > Date.now()) {
+    return {
+      error: "ChatGPT Desktop 觸發短暫異常流量保護冷卻中（rate_limit_exceeded: unusual activity），請稍後再試",
+      stage: "rate_limited",
+      retrySafe: true,
+      outcome: "cooldown",
+    };
+  }
   const options = ${JSON.stringify(normalizedOptions)};
   const events = [];
   let sendAttempted = false;
@@ -658,6 +666,7 @@ ${buildResolverJs(preferredExports)}
       /unusual activity/i.test(JSON.stringify(streamError ?? ""))
     ) {
       globalThis.__magpieAttestedCache = null;
+      globalThis.__magpieUnusualActivityUntil = Date.now() + 15 * 60 * 1000;
       return {
         error: "ChatGPT Desktop 觸發短暫異常流量保護（rate_limit_exceeded: unusual activity），請稍後再試",
         stage: "rate_limited",
