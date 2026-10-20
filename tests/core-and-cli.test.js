@@ -22,6 +22,7 @@ import {
   parsePortFromCommandArgs,
   preferredClientExports,
   probeClient,
+  resetUnusualActivityCooldown,
   resolveCdpPort,
   sendConversation,
 } from "../src/core.js";
@@ -273,6 +274,9 @@ const startMockCdpServer = async (scenario = {}) => {
             `        init.onComplete({ conversation_id: "conv-stream-456" });`,
             `      } else if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {`,
             `        init.onComplete({ conversation_id: "conv-123" });`,
+            `      } else if (scenario.kind === "unusual") {`,
+            `        init.onEvent({ type: "fetch-stream-event", data: { conversation_id: "conv-unusual" } });`,
+            `        init.onError({ type: "fetch-stream-error", error: JSON.stringify({ error: "Our systems have detected unusual activity coming from your system. Please try again later." }), responseStatus: 200, failureOrigin: "server_stream" });`,
             `      } else if (scenario.kind === "rate") {`,
             `        init.onError({ status: 429, error: { code: "rate_limit_exceeded" } });`,
             `      } else if (scenario.kind === "conflicting-code") {`,
@@ -637,6 +641,51 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(overCapErr.retrySafe).toBe(true);
       expect(mock.state.requests.length).toBe(1);
     } finally {
+      mock.stop();
+    }
+  });
+
+  test("串流中途插入 unusual activity 時用對話編號讀回已寫完的答案，不啟動冷卻", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", answer: "recovered answer" });
+    try {
+      const chat = await sendConversation({
+        cdpUrl: mock.cdpUrl,
+        prompt: "hi",
+        model: "gpt-6-thinking",
+        timeoutMs: 121000,
+      });
+      expect(chat.answer).toBe("recovered answer");
+      expect(chat.conversationId).toBe("conv-unusual");
+      expect(chat.outcome).toBe("recovered");
+      expect(chat.recoverReads).toBe(1);
+      expect(mock.state.reads).toContain("/conversation/conv-unusual");
+      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now());
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("unusual activity 後讀不到完成答案時回 429 並啟動冷卻", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", emptyConversation: true });
+    try {
+      let err = null;
+      try {
+        await sendConversation({
+          cdpUrl: mock.cdpUrl,
+          prompt: "hi",
+          model: "gpt-6-thinking",
+          timeoutMs: 121000,
+        });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(err?.stage).toBe("rate_limited");
+      expect(mock.state.reads.filter((r) => r.startsWith("/conversation/")).length).toBeGreaterThan(0);
+      expect(globalThis.__magpieUnusualActivityUntil).toBeGreaterThan(Date.now());
+    } finally {
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
       mock.stop();
     }
   });

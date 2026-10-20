@@ -687,11 +687,11 @@ ${buildResolverJs(preferredExports)}
         outcome,
       };
     }
-    if (
+    const unusualActivity =
       outcome === "error" &&
       !assistantSeen &&
-      /unusual activity/i.test(JSON.stringify(streamError ?? ""))
-    ) {
+      /unusual activity/i.test(JSON.stringify(streamError ?? ""));
+    const rateLimited = (extra) => {
       globalThis.__magpieAttestedCache = null;
       globalThis.__magpieUnusualActivityUntil = Date.now() + 15 * 60 * 1000;
       return {
@@ -699,8 +699,10 @@ ${buildResolverJs(preferredExports)}
         stage: "rate_limited",
         retrySafe: true,
         outcome,
+        ...extra,
       };
-    }
+    };
+    if (unusualActivity && !conversationId) return rateLimited({});
     if (!conversationId) {
       return {
         error: "串流沒有確認送出狀態",
@@ -763,6 +765,30 @@ ${buildResolverJs(preferredExports)}
         };
       }
     };
+    // 2026-10-20 實測：unusual activity 是伺服器串流中途插入的錯誤（responseStatus 200），
+    // 對話已建立且回答會在背景寫完；用對話編號讀回，就不必白丟這則回答、也不必冷卻。
+    // 漸長間隔是為了壓低讀取次數，避免讀取本身再被判成異常流量。
+    let recoverReads = 0;
+    if (unusualActivity) {
+      const waits = [3000, 5000, 10000, 15000, 20000, 30000];
+      const deadline = Date.now() + (options.recoverWithinMs ?? 300000);
+      while (best === null && Date.now() < deadline) {
+        const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
+        await new Promise((r) => setTimeout(r, wait));
+        recoverReads += 1;
+        let conversation;
+        try {
+          conversation = await client.safeGet("/conversation/" + encodeURIComponent(conversationId), {});
+        } catch (error) {
+          if (/unusual activity/i.test(String(error?.message ?? error))) break;
+          continue;
+        }
+        for (const node of Object.values(conversation?.mapping ?? {})) {
+          considerMessage(node?.message);
+        }
+      }
+      if (best === null) return rateLimited({ conversationId, recoverReads });
+    }
     if (outcome === "complete") {
       for (const rawEv of events) {
         let ev = rawEv;
@@ -774,7 +800,7 @@ ${buildResolverJs(preferredExports)}
         if (msgCandidate) considerMessage(msgCandidate);
       }
     }
-    if (outcome !== "complete" || best === null) {
+    if (!unusualActivity && (outcome !== "complete" || best === null)) {
       const conversation = await client.safeGet(
         \`/conversation/\${encodeURIComponent(conversationId)}\`,
         {},
@@ -799,7 +825,8 @@ ${buildResolverJs(preferredExports)}
       model: best.model,
       requestedModel: requestModel,
       conversationId,
-      outcome,
+      outcome: unusualActivity ? "recovered" : outcome,
+      recoverReads,
       eventCount: events.length,
       clientExport: resolved.exportName,
     };
@@ -1427,7 +1454,7 @@ export const sendConversation = async ({
   detectRunningPort,
   fetchImpl,
   WebSocketImpl,
-  timeoutMs = 300000,
+  timeoutMs = 420000,
   targetTimeoutMs = 4000,
   signal,
 } = {}) => {
@@ -1477,6 +1504,8 @@ export const sendConversation = async ({
         model: selectedModel,
         effort,
         instantFallback: useInstantFallback,
+        // 留 2 分鐘給撈不到答案時 Magpie 換備援，不讓整段先撞外層逾時。
+        recoverWithinMs: Math.max(0, Math.min(300000, timeoutMs - 120000)),
       },
       preferred,
     );
@@ -1556,6 +1585,7 @@ export const sendConversation = async ({
     requestedModel,
     conversationId: result.conversationId ?? null,
     outcome: result.outcome,
+    recoverReads: result.recoverReads ?? 0,
     eventCount: result.eventCount ?? 0,
     clientExport: result.clientExport ?? null,
     fallbackUsed: fallbackId !== null,

@@ -578,7 +578,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 effort,
                 instantFallback,
                 allowProFallback: true,
-                timeoutMs: pluginOptions?.chatTimeoutMs ?? 300000,
+                timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
                 targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
                 signal: init?.signal,
                 onFallbackStart: ({ fallbackId, requestedModel }) => {
