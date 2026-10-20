@@ -376,7 +376,9 @@ export const buildResolverJs = (
     if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
     const cacheKey = \`\${primaryUrl}|\${preferredClientExports.join(",")}\`;
     const cached = globalThis.__magpieAttestedCache;
+    // 實驗：被標記期間的 403「from your device」都出現在沿用快取 challenge 的請求上，暫時每筆都拿新 challenge。
     if (
+      globalThis.__magpieAttestCacheOff !== true &&
       cached &&
       cached.cacheKey === cacheKey &&
       cached.expiresAt > Date.now() &&
