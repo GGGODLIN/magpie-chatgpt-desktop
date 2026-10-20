@@ -635,6 +635,33 @@ ${buildResolverJs(preferredExports)}
       }
       return null;
     };
+    // 限流期伺服器仍會生完回答；先留原始錯誤與對話編號，才能判斷能否回頭撈答案。只記事件形狀，不存 prompt。
+    if (outcome !== "complete") {
+      const describe = (value) => {
+        if (typeof value === "string") {
+          try { value = JSON.parse(value); } catch { return "text:" + value.slice(0, 120); }
+        }
+        if (!value || typeof value !== "object") return typeof value;
+        return [value.type, value.event, value.message?.author?.role, value.message?.status]
+          .filter(Boolean).join("/") || Object.keys(value).slice(0, 6).join(",");
+      };
+      let errorText;
+      try {
+        errorText = JSON.stringify(streamError, Object.getOwnPropertyNames(streamError ?? {}));
+      } catch {
+        errorText = String(streamError);
+      }
+      const diag = {
+        at: new Date().toISOString(),
+        outcome,
+        conversationId,
+        assistantSeen,
+        eventCount: events.length,
+        eventShapes: events.slice(0, 40).map(describe),
+        streamError: (errorText ?? "").slice(0, 4000),
+      };
+      globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-5);
+    }
     const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
     if (
       (errorCode === "input_too_large" || errorCode === "message_length_exceeds_limit") &&
