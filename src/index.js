@@ -40,8 +40,15 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
         return "ChatGPT Desktop 裝置驗證挑戰失敗或尚未登入（Attestation challenge failed or not signed in）。請打開 ChatGPT.app 確認已完成帳號登入。";
       case "unsupported_input":
         return "ChatGPT Desktop 僅支援純文字訊息，不支援圖片、音訊、非文字附件或工具角色（Unsupported non-text input）。";
-      case "quota_exceeded":
-        return "ChatGPT Desktop 模型配額已滿（Quota exceeded: model_cap_exceeded）。如需自動退回 Instant 模型，請開啟供應商設定的「instant_fallback」開關。";
+      case "context_length_exceeded":
+        return "ChatGPT Desktop 訊息長度超過單次上下文上限（context_length_exceeded: prompt is too long）。";
+      case "quota_exceeded": {
+        const resetIso = new Date(Date.now() + 15 * 60 * 1000)
+          .toISOString()
+          .slice(0, 19)
+          .replace("T", " ");
+        return `ChatGPT Desktop 模型配額已滿（Quota exceeded: model_cap_exceeded, resets at ${resetIso} UTC+0, please switch to the other models）。如需自動退回 Instant 模型，請開啟供應商設定的「instant_fallback」開關。`;
+      }
       case "unknown_send_state":
         return "ChatGPT Desktop 對話請求已送出但連線中斷或未確認完成狀態（Unknown send state）；為避免重複扣額，請勿自動重送。";
       default:
@@ -327,6 +334,14 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 input: ["text"],
                 output: ["text"],
               },
+              ...(m.context_window > 0
+                ? {
+                    limit: {
+                      context: m.context_window,
+                      output: 0,
+                    },
+                  }
+                : {}),
               capabilities: {
                 temperature: false,
                 reasoning,
@@ -631,6 +646,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                       finish_reason: "stop",
                     },
                   ],
+                  ...(result.usage ? { usage: result.usage } : {}),
                 };
                 const ssePayload =
                   `data: ${JSON.stringify(deltaChunk)}\n\n` +
@@ -661,6 +677,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                       finish_reason: "stop",
                     },
                   ],
+                  ...(result.usage ? { usage: result.usage } : {}),
                 }),
                 {
                   status: 200,
@@ -669,6 +686,25 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
               );
             } catch (error) {
               const message = formatDiagnostic(error);
+              if (
+                error?.stage === "context_length_exceeded" ||
+                error?.status === 413
+              ) {
+                return new Response(
+                  JSON.stringify({
+                    error: {
+                      message,
+                      type: "invalid_request_error",
+                      code: "context_length_exceeded",
+                    },
+                  }),
+                  {
+                    status: 413,
+                    headers: { "content-type": "application/json" },
+                  },
+                );
+              }
+
               if (
                 error?.stage === "unsupported_input" ||
                 error?.status === 400

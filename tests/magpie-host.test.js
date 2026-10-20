@@ -875,6 +875,8 @@ describe("Ticket 02 — 真實 Magpie Bun 外掛宿主整合測試", () => {
         expect(res.status).toBe(429);
         const errBody = JSON.parse(res.body);
         expect(errBody.error.code).toBe("model_cap_exceeded");
+        expect(errBody.error.message).toContain("switch to the other models");
+        expect(errBody.error.message).toContain("resets at ");
       }
       expect(mock.state.requests.map((r) => r.model)).toEqual([
         THINKING_MODEL,
@@ -968,6 +970,11 @@ describe("Ticket 02 — 真實 Magpie Bun 外掛宿主整合測試", () => {
         content: "Hello from host bridge",
       });
       expect(parsedJson.choices[0].finish_reason).toBe("stop");
+      expect(parsedJson.usage).toEqual({
+        prompt_tokens: 3,
+        completion_tokens: 6,
+        total_tokens: 9,
+      });
 
       // (b) SSE 串流回應 (stream: true)
       const sseRes = await host.call("fetch", {
@@ -989,6 +996,8 @@ describe("Ticket 02 — 真實 Magpie Bun 外掛宿主整合測試", () => {
       expect(sseRes.body).toContain('"object":"chat.completion.chunk"');
       expect(sseRes.body).toContain("Hello from host bridge");
       expect(sseRes.body).toContain('"finish_reason":"stop"');
+      expect(sseRes.body).toContain('"prompt_tokens":3');
+      expect(sseRes.body).toContain('"completion_tokens":6');
       expect(sseRes.body).toContain("data: [DONE]");
 
       // (c) 夾帶非文字輸入時回傳 HTTP 400，且不向桌面版送出任何對話請求

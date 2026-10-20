@@ -613,8 +613,29 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       });
       expect(chat.answer).toBe('{"findings":[]}');
       expect(chat.conversationId).toBe("conv-stream-456");
+      expect(chat.usage).toEqual({
+        prompt_tokens: 4,
+        completion_tokens: 4,
+        total_tokens: 8,
+      });
       expect(mock.state.requests[0].supported_encodings).toEqual([]);
       expect(mock.state.reads).toEqual(["/ios/attestation_challenge"]);
+
+      let overCapErr = null;
+      try {
+        await sendConversation({
+          cdpUrl: mock.cdpUrl,
+          prompt: "x".repeat(500001),
+          model: "gpt-6-thinking",
+        });
+      } catch (err) {
+        overCapErr = err;
+      }
+      expect(overCapErr).toBeInstanceOf(ChatGPTDesktopError);
+      expect(overCapErr.stage).toBe("context_length_exceeded");
+      expect(overCapErr.status).toBe(413);
+      expect(overCapErr.retrySafe).toBe(true);
+      expect(mock.state.requests.length).toBe(1);
     } finally {
       mock.stop();
     }

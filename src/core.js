@@ -9,6 +9,21 @@ export const DEFAULT_CDP_PORT = 19333;
 export const HIGH_PORT_MIN = 58000;
 export const HIGH_PORT_MAX = 65000;
 export const RENDERER_URL = "app://-/index.html";
+export const MAX_PROMPT_BYTES = 500000;
+
+export const estimateTokenCount = (text) => {
+  const str = String(text ?? "");
+  let ascii = 0;
+  let other = 0;
+  for (const ch of str) {
+    if (ch.codePointAt(0) < 128) {
+      ascii += 1;
+    } else {
+      other += 1;
+    }
+  }
+  return Math.floor((ascii + 3) / 4) + other;
+};
 
 export class ChatGPTDesktopError extends Error {
   constructor(
@@ -570,22 +585,37 @@ ${buildResolverJs(preferredExports)}
     // 只在結構化錯誤欄位遞迴；若外層已有非 model_cap_exceeded 的 code/type（如 rate_limit_exceeded），
     // 不得誤信內層 message 字串中的 model_cap_exceeded 而觸發重送。
     const errorSeen = new Set();
-    const quotaCode = (value) => {
+    const recognizedErrorCode = (value) => {
       if (typeof value === "string") {
         try { value = JSON.parse(value); } catch { return null; }
       }
       if (!value || typeof value !== "object" || errorSeen.has(value)) return null;
       errorSeen.add(value);
-      if (typeof value.code === "string") return value.code === "model_cap_exceeded" ? value.code : null;
-      if (typeof value.type === "string") return value.type === "model_cap_exceeded" ? value.type : null;
+      const allowed = ["model_cap_exceeded", "input_too_large", "message_length_exceeds_limit"];
+      if (typeof value.code === "string") return allowed.includes(value.code) ? value.code : null;
+      if (typeof value. errorCode === "string") return allowed.includes(value.errorCode) ? value.errorCode : null;
+      if (typeof value.type === "string") return allowed.includes(value.type) ? value.type : null;
       for (const key of ["error", "detail", "data", "body", "message"]) {
-        const code = quotaCode(value[key]);
+        const code = recognizedErrorCode(value[key]);
         if (code) return code;
       }
       return null;
     };
-    const errorCode = outcome === "error" ? quotaCode(streamError) : null;
-    if (errorCode && !conversationId && !assistantSeen) {
+    const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
+    if (
+      (errorCode === "input_too_large" || errorCode === "message_length_exceeds_limit") &&
+      !conversationId &&
+      !assistantSeen
+    ) {
+      return {
+        error: "提示內容超過模型上下文或單一訊息長度上限（context_length_exceeded）",
+        stage: "context_length_exceeded",
+        errorCode,
+        retrySafe: true,
+        outcome,
+      };
+    }
+    if (errorCode === "model_cap_exceeded" && !conversationId && !assistantSeen) {
       return {
         error: "模型配額明確拒絕本次請求",
         stage: "quota_exceeded",
@@ -824,6 +854,20 @@ const roleLabel = (role) => {
 };
 
 export const formatMessagesToPrompt = (messagesOrPrompt) => {
+  const enforceByteCap = (formatted) => {
+    if (Buffer.byteLength(formatted, "utf8") > MAX_PROMPT_BYTES) {
+      throw new ChatGPTDesktopError(
+        `提示內容超過 ChatGPT Desktop 單次訊息上限（${MAX_PROMPT_BYTES} bytes, context_length_exceeded）`,
+        {
+          stage: "context_length_exceeded",
+          retrySafe: true,
+          status: 413,
+        },
+      );
+    }
+    return formatted;
+  };
+
   if (typeof messagesOrPrompt === "string") {
     const trimmed = messagesOrPrompt.trim();
     if (!trimmed) {
@@ -833,7 +877,7 @@ export const formatMessagesToPrompt = (messagesOrPrompt) => {
         status: 400,
       });
     }
-    return trimmed;
+    return enforceByteCap(trimmed);
   }
 
   if (!Array.isArray(messagesOrPrompt) || messagesOrPrompt.length === 0) {
@@ -859,12 +903,14 @@ export const formatMessagesToPrompt = (messagesOrPrompt) => {
   }
 
   if (nonEmpty.length === 1 && nonEmpty[0].role === "user") {
-    return nonEmpty[0].text;
+    return enforceByteCap(nonEmpty[0].text);
   }
 
-  return nonEmpty
-    .map((item) => `[${roleLabel(item.role)}]\n${item.text}`)
-    .join("\n\n");
+  return enforceByteCap(
+    nonEmpty
+      .map((item) => `[${roleLabel(item.role)}]\n${item.text}`)
+      .join("\n\n"),
+  );
 };
 
 const attachWsListener = (ws, event, handler) => {
@@ -1084,7 +1130,11 @@ export const evaluateInRenderer = ({
             : retrySafe
               ? "client_not_found"
               : "unknown_send_state");
-        const status = value.quotaRejected ? 429 : 502;
+        const status = value.quotaRejected
+          ? 429
+          : stage === "context_length_exceeded"
+            ? 413
+            : 502;
         const rawErr =
           typeof value.error === "string" ? value.error.trim() : "";
         fail(
@@ -1146,6 +1196,9 @@ export const normalizeCatalogModels = (catalog) => {
       input_modalities: ["text"],
       output_modalities: ["text"],
     };
+    if (typeof item?.max_tokens === "number" && item.max_tokens > 0) {
+      entry.context_window = item.max_tokens;
+    }
     if (item.reasoning !== undefined || Array.isArray(item.thinking_efforts)) {
       entry.reasoning = Boolean(
         item.reasoning ?? item.thinking_efforts?.length,
@@ -1405,6 +1458,8 @@ export const sendConversation = async ({
   }
 
   const requestedModel = result.requestedModel ?? selectedModel;
+  const promptTokens = estimateTokenCount(formattedPrompt);
+  const completionTokens = estimateTokenCount(result.answer);
   return {
     answer: result.answer,
     model: result.model ?? requestedModel,
@@ -1415,6 +1470,11 @@ export const sendConversation = async ({
     clientExport: result.clientExport ?? null,
     fallbackUsed: fallbackId !== null,
     fallbackId,
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
   };
 };
 
