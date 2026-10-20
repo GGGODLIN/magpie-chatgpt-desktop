@@ -203,6 +203,12 @@ const startMockCdpServer = async (scenario = {}) => {
             `        }`,
             `        return catalog;`,
             `      }`,
+            `      if (path.endsWith("/stream_status")) {`,
+            `        if (scenario.statusThrows) throw new Error("Too many requests");`,
+            `        const seq = scenario.streamStatuses ?? ["COMPLETE"];`,
+            `        const n = globalThis.__testReads.filter((p) => p === path).length;`,
+            `        return { status: seq[Math.min(n - 1, seq.length - 1)] };`,
+            `      }`,
             `      if (scenario.throwEmptyErrorOnConversationGet) {`,
             `        throw new Error("");`,
             `      }`,
@@ -761,10 +767,32 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     }
   });
 
-  test("回答停在 in_progress 且對話超過 45 秒沒更新時，讀一次就放棄", async () => {
-    const mock = await startMockCdpServer({ kind: "unusual", stalledConversation: true });
+  test("串流狀態仍是 IS_STREAMING 時不讀整段對話，轉為 COMPLETE 後只讀一次", async () => {
+    const mock = await startMockCdpServer({
+      kind: "unusual",
+      answer: "recovered answer",
+      streamStatuses: ["IS_STREAMING", "IS_STREAMING", "IS_STREAMING", "COMPLETE"],
+    });
     try {
-      globalThis.__magpieReadWaits = [50, 50];
+      globalThis.__magpieStatusGapMs = 20;
+      const chat = await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      expect(chat.answer).toBe("recovered answer");
+      expect(chat.recoverReads).toBe(1);
+      expect(mock.state.reads.filter((r) => r === "/conversation/conv-unusual/stream_status").length).toBe(4);
+      expect(mock.state.reads.filter((r) => r === "/conversation/conv-unusual").length).toBe(1);
+    } finally {
+      delete globalThis.__magpieStatusGapMs;
+      globalThis.__magpieSoftFlagAt = 0;
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("串流狀態連續三次查不到時停掉撈答案與送出 10 分鐘，且不讀整段對話", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", statusThrows: true });
+    try {
+      globalThis.__magpieStatusGapMs = 20;
       let err = null;
       try {
         await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
@@ -772,10 +800,33 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
         err = error;
       }
       expect(err?.status).toBe(429);
-      expect(err?.details?.recoverReads).toBe(1);
+      expect(mock.state.reads.filter((r) => r === "/conversation/conv-unusual").length).toBe(0);
+      expect(globalThis.__magpieReadBlockedUntil - Date.now()).toBeGreaterThan(9 * 60 * 1000);
+    } finally {
+      delete globalThis.__magpieStatusGapMs;
+      globalThis.__magpieReadBlockedUntil = 0;
+      globalThis.__magpieSoftFlagAt = 0;
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("串流狀態已結束但回答停在 in_progress 時，最多讀兩次就放棄", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", stalledConversation: true });
+    try {
+      globalThis.__magpieStatusGapMs = 50;
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(err?.details?.recoverReads).toBe(2);
       expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now() + 2000);
     } finally {
-      delete globalThis.__magpieReadWaits;
+      delete globalThis.__magpieStatusGapMs;
       globalThis.__magpieSoftFlagAt = 0;
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();

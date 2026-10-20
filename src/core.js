@@ -814,7 +814,9 @@ ${buildResolverJs(preferredExports)}
         outcome,
         conversationId,
         recoverReads,
-        retryAfterMs: Math.max(pauseMs, 1000),
+        // Retry-After 太短時 Magpie 會在同一請求內對同一個 provider 立刻重送（2026-10-21 實測 1 秒→連送 4 次、
+        // 每次都是一則新生成），群組裡還會拖過 claude-mem 的 300 秒逾時；給 30 秒讓它改走下一個成員。
+        retryAfterMs: Math.max(pauseMs, 30000),
       };
     };
     if (recoverable) {
@@ -825,60 +827,87 @@ ${buildResolverJs(preferredExports)}
         return giveUp("撈答案名額已滿", 0);
       }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
-      // 2026-10-20 實測讀取額度約 6 分半內 23 次就被限流，而長回答常要 60～150 秒才寫完；
-      // 少讀幾次比早讀到重要，預設第 20 秒讀第一次、之後每 30 秒。
-      const waits = globalThis.__magpieReadWaits ?? [20000, 30000];
+      // 整段對話的 GET 額度很緊（2026-10-20 實測約 6 分半 23 次就被限流），但 App 自己續傳前用的
+      // stream_status 不算在內（2026-10-21 實測 5 分半連打 140 次都正常，之後 GET 也正常）。
+      // 所以先輪詢 stream_status，等它不再是 IS_STREAMING 才讀整段對話，每撈一筆通常只花一次 GET。
+      // 不能拿對話 update_time 判斷停住：thinking 寫正文期間它不會更新，曾把 197 秒寫完的回答在 184 秒誤判放棄。
+      const statusGapMs = globalThis.__magpieStatusGapMs ?? 5000;
+      const withTimeout = (promise, label) => Promise.race([
+        promise,
+        // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
+        new Promise((_, reject) => setTimeout(() => reject(new Error(label + " timeout 20s")), 20000)),
+      ]);
       const startedAt = Date.now();
       const deadline = startedAt + (options.recoverWithinMs ?? 90000);
       const readLog = [];
       let readRejected = false;
       let stalled = false;
+      let statusPolls = 0;
+      let statusErrors = 0;
+      let lastStatus = null;
       try {
         while (best === null && Date.now() < deadline) {
-          const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
-          await new Promise((r) => setTimeout(r, wait));
-          recoverReads += 1;
-          const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
-          let conversation;
+          await new Promise((r) => setTimeout(r, Math.min(statusGapMs, deadline - Date.now())));
+          const elapsed = Math.round((Date.now() - startedAt) / 1000);
+          let status;
           try {
-            // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
-            conversation = await Promise.race([
-              client.safeGet("/conversation/" + encodeURIComponent(conversationId), {}),
-              new Promise((_, reject) => setTimeout(() => reject(new Error("read timeout 20s")), 20000)),
-            ]);
+            statusPolls += 1;
+            status = (await withTimeout(
+              client.safeGet("/conversation/" + encodeURIComponent(conversationId) + "/stream_status", {}),
+              "status",
+            ))?.status ?? null;
+            statusErrors = 0;
           } catch (error) {
-            entry.thrown = String(error?.message ?? error).slice(0, 200);
+            statusErrors += 1;
+            readLog.push({ s: elapsed, statusThrown: String(error?.message ?? error).slice(0, 200) });
+            if (statusErrors >= 3) { readRejected = true; break; }
+            continue;
+          }
+          if (status !== lastStatus) readLog.push({ s: elapsed, status });
+          lastStatus = status;
+          if (status === "IS_STREAMING") continue;
+          // 剛轉 COMPLETE 時正文偶爾還沒落進 mapping，讀到仍在寫就隔一輪再讀一次，最多兩次 GET。
+          for (let attempt = 0; attempt < 2 && best === null; attempt += 1) {
+            if (attempt > 0) await new Promise((r) => setTimeout(r, statusGapMs));
+            recoverReads += 1;
+            const entry = { s: Math.round((Date.now() - startedAt) / 1000), read: true };
+            let conversation;
+            try {
+              conversation = await withTimeout(
+                client.safeGet("/conversation/" + encodeURIComponent(conversationId), {}),
+                "read",
+              );
+            } catch (error) {
+              entry.thrown = String(error?.message ?? error).slice(0, 200);
+              readLog.push(entry);
+              readRejected = true;
+              break;
+            }
+            const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
+            entry.assistant = nodes
+              .filter((message) => message.author?.role === "assistant")
+              .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
+            for (const message of nodes) considerMessage(message);
+            entry.found = best !== null;
             readLog.push(entry);
-            readRejected = true;
-            break;
+            if (!nodes.some((m) => m.author?.role === "assistant" && m.status === "in_progress")) break;
           }
-          const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
-          entry.nodes = nodes.length;
-          if (nodes.length === 0) entry.raw = JSON.stringify(conversation ?? null).slice(0, 200);
-          entry.assistant = nodes
-            .filter((message) => message.author?.role === "assistant")
-            .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
-          for (const message of nodes) considerMessage(message);
-          entry.found = best !== null;
-          readLog.push(entry);
-          // 2026-10-21 實測 gpt-6-instant 的長回答在串流被插錯後約 60 秒就停在 in_progress、再也不會寫完
-          // （25 分鐘後仍是同一份半截內容）；對話超過 45 秒沒更新就判定停住，別再耗讀取額度。
-          const stillWriting = nodes.some((m) => m.author?.role === "assistant" && m.status === "in_progress");
-          const idleSec = Date.now() / 1000 - Number(conversation?.update_time ?? 0);
-          if (best === null && stillWriting && Number.isFinite(idleSec) && idleSec > 45) {
-            entry.stalled = Math.round(idleSec);
-            stalled = true;
-            break;
-          }
+          // 串流已結束卻沒有完稿：2026-10-21 實測 gpt-6-instant 長回答會停在 in_progress、stream_status 卻報 COMPLETE，
+          // 之後再也不會寫完，不必再等。
+          if (best === null && !readRejected) stalled = true;
+          break;
         }
       } finally {
         globalThis.__magpieRecovering = Math.max(0, (globalThis.__magpieRecovering ?? 1) - 1);
         const mine = (globalThis.__magpieStreamDiag ?? []).find((d) => d.conversationId === conversationId);
-        if (mine) mine.reads = readLog.slice(-20);
+        if (mine) {
+          mine.reads = readLog.slice(-20);
+          mine.statusPolls = statusPolls;
+        }
       }
       if (best === null) {
         if (readRejected) return giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000);
-        if (stalled) return giveUp("回答中途停住", 0);
+        if (stalled) return giveUp("回答停在半截（串流狀態 " + lastStatus + "）", 0);
         return giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
       }
     }
