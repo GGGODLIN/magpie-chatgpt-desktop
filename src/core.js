@@ -813,6 +813,7 @@ ${buildResolverJs(preferredExports)}
       const deadline = startedAt + (options.recoverWithinMs ?? 90000);
       const readLog = [];
       let readRejected = false;
+      let stalled = false;
       try {
         while (best === null && Date.now() < deadline) {
           const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
@@ -841,6 +842,15 @@ ${buildResolverJs(preferredExports)}
           for (const message of nodes) considerMessage(message);
           entry.found = best !== null;
           readLog.push(entry);
+          // 2026-10-21 實測 gpt-6-instant 的長回答在串流被插錯後約 60 秒就停在 in_progress、再也不會寫完
+          // （25 分鐘後仍是同一份半截內容）；對話超過 45 秒沒更新就判定停住，別再耗讀取額度。
+          const stillWriting = nodes.some((m) => m.author?.role === "assistant" && m.status === "in_progress");
+          const idleSec = Date.now() / 1000 - Number(conversation?.update_time ?? 0);
+          if (best === null && stillWriting && Number.isFinite(idleSec) && idleSec > 45) {
+            entry.stalled = Math.round(idleSec);
+            stalled = true;
+            break;
+          }
         }
       } finally {
         globalThis.__magpieRecovering = Math.max(0, (globalThis.__magpieRecovering ?? 1) - 1);
@@ -848,9 +858,9 @@ ${buildResolverJs(preferredExports)}
         if (mine) mine.reads = readLog.slice(-20);
       }
       if (best === null) {
-        return readRejected
-          ? giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000)
-          : giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
+        if (readRejected) return giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000);
+        if (stalled) return giveUp("回答中途停住", 0);
+        return giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
       }
     }
     if (outcome === "complete") {

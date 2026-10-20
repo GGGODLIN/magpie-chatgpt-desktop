@@ -206,6 +206,9 @@ const startMockCdpServer = async (scenario = {}) => {
             `      if (scenario.throwEmptyErrorOnConversationGet) {`,
             `        throw new Error("");`,
             `      }`,
+            `      if (scenario.stalledConversation) {`,
+            `        return { update_time: Date.now() / 1000 - 120, mapping: { a: { message: { author: { role: "assistant" }, status: "in_progress", channel: "final", recipient: "all", content: { content_type: "text", parts: ["half"] } } } } };`,
+            `      }`,
             `      if (scenario.kind === "accepted-quota" || scenario.emptyConversation) {`,
             `        return { mapping: {} };`,
             `      }`,
@@ -752,6 +755,28 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     } finally {
       globalThis.__magpieSoftFlagAt = 0;
       globalThis.__magpieRecovering = 0;
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("回答停在 in_progress 且對話超過 45 秒沒更新時，讀一次就放棄", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", stalledConversation: true });
+    try {
+      globalThis.__magpieReadWaits = [50, 50];
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(err?.details?.recoverReads).toBe(1);
+      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now() + 2000);
+    } finally {
+      delete globalThis.__magpieReadWaits;
+      globalThis.__magpieSoftFlagAt = 0;
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();
       mock.stop();
