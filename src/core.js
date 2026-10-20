@@ -579,14 +579,9 @@ ${buildResolverJs(preferredExports)}
     };
     if (!options.instantFallback && options.effort) body.thinking_effort = options.effort;
 
-    // 被標記期間，兩筆 POST 間隔太近（實測 6～41 秒）就會被 403 直接拒收；
-    // 檢查與登記之間沒有 await，同時進來的請求不會一起通過。
+    // 前面的 await 期間可能已有別筆被拒收而啟動冷卻，送出前再看一次。
     const blocked = coolingDown();
     if (blocked) return blocked;
-    const postedAt = Date.now();
-    const minPostGapMs = options.minPostGapMs ?? 60000;
-    const flaggedRecently = postedAt - (globalThis.__magpieFlaggedAt ?? 0) < 60 * 60 * 1000;
-    if (flaggedRecently) globalThis.__magpieUnusualActivityUntil = postedAt + minPostGapMs;
 
     const outcome = await new Promise((resolve) => {
       let settled = false;
@@ -713,7 +708,6 @@ ${buildResolverJs(preferredExports)}
       [403, 429].includes(errorObject?.responseStatus);
     if (rejectedBeforeConversation) {
       globalThis.__magpieAttestedCache = null;
-      globalThis.__magpieFlaggedAt = Date.now();
       globalThis.__magpieUnusualActivityUntil = Date.now() + 3 * 60 * 1000;
       return {
         error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
@@ -724,13 +718,6 @@ ${buildResolverJs(preferredExports)}
       };
     }
     const recoverable = outcome !== "complete" && errorCode === null;
-    if (recoverable && conversationId) {
-      globalThis.__magpieFlaggedAt = Date.now();
-      globalThis.__magpieUnusualActivityUntil = Math.max(
-        globalThis.__magpieUnusualActivityUntil ?? 0,
-        postedAt + minPostGapMs,
-      );
-    }
     if (!conversationId) {
       return {
         error: "串流沒有確認送出狀態",
@@ -808,7 +795,11 @@ ${buildResolverJs(preferredExports)}
         const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
         let conversation;
         try {
-          conversation = await client.safeGet("/conversation/" + encodeURIComponent(conversationId), {});
+          // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
+          conversation = await Promise.race([
+            client.safeGet("/conversation/" + encodeURIComponent(conversationId), {}),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("read timeout 20s")), 20000)),
+          ]);
         } catch (error) {
           entry.thrown = String(error?.message ?? error).slice(0, 200);
           readLog.push(entry);
@@ -824,8 +815,8 @@ ${buildResolverJs(preferredExports)}
         entry.found = best !== null;
         readLog.push(entry);
       }
-      const last = (globalThis.__magpieStreamDiag ?? []).at(-1);
-      if (last?.conversationId === conversationId) last.reads = readLog.slice(-20);
+      const mine = (globalThis.__magpieStreamDiag ?? []).find((d) => d.conversationId === conversationId);
+      if (mine) mine.reads = readLog.slice(-20);
       if (best === null) {
         return {
           error: "串流中斷後 " + Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應",

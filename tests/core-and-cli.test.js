@@ -661,10 +661,9 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(chat.outcome).toBe("recovered");
       expect(chat.recoverReads).toBe(1);
       expect(mock.state.reads).toContain("/conversation/conv-unusual");
-      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now() + 61 * 1000);
+      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now());
     } finally {
       globalThis.__magpieUnusualActivityUntil = 0;
-      globalThis.__magpieFlaggedAt = 0;
       resetUnusualActivityCooldown();
       mock.stop();
     }
@@ -687,33 +686,9 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(err?.stage).toBe("unknown_send_state");
       expect(err?.retrySafe).toBe(false);
       expect(mock.state.reads.filter((r) => r.startsWith("/conversation/")).length).toBeGreaterThan(0);
-      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now() + 61 * 1000);
+      expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now());
     } finally {
       globalThis.__magpieUnusualActivityUntil = 0;
-      globalThis.__magpieFlaggedAt = 0;
-      resetUnusualActivityCooldown();
-      mock.stop();
-    }
-  });
-
-  test("被標記後 60 秒內的下一筆在本機回 429，不送出 POST", async () => {
-    const mock = await startMockCdpServer({ kind: "unusual", answer: "first" });
-    try {
-      const first = await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", timeoutMs: 121000 });
-      expect(first.answer).toBe("first");
-      let err = null;
-      try {
-        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "again", model: "gpt-6-thinking", timeoutMs: 121000 });
-      } catch (error) {
-        err = error;
-      }
-      expect(err?.status).toBe(429);
-      expect(err?.details?.retryAfterMs).toBeGreaterThan(50 * 1000);
-      expect(err?.details?.retryAfterMs).toBeLessThanOrEqual(60 * 1000);
-      expect(mock.state.requests.length).toBe(1);
-    } finally {
-      globalThis.__magpieUnusualActivityUntil = 0;
-      globalThis.__magpieFlaggedAt = 0;
       resetUnusualActivityCooldown();
       mock.stop();
     }
@@ -736,7 +711,6 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(remaining).toBeLessThanOrEqual(180 * 1000);
     } finally {
       globalThis.__magpieUnusualActivityUntil = 0;
-      globalThis.__magpieFlaggedAt = 0;
       resetUnusualActivityCooldown();
       mock.stop();
     }
