@@ -367,6 +367,16 @@ export const buildResolverJs = (
   const attestedClient = async () => {
     const { appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
     if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
+    const cacheKey = \`\${primaryUrl}|\${preferredClientExports.join(",")}\`;
+    const cached = globalThis.__magpieAttestedCache;
+    if (
+      cached &&
+      cached.cacheKey === cacheKey &&
+      cached.expiresAt > Date.now() &&
+      cached.resolved?.client
+    ) {
+      return cached.resolved;
+    }
     const attestationProbe = (candidate) =>
       candidate.safeGet("/ios/attestation_challenge", {
         additionalHeaders: { "X-OpenAI-Attach-DeviceCheck-Token": "1" },
@@ -386,7 +396,16 @@ export const buildResolverJs = (
         moduleUrl,
       };
     }
-    return { ...resolved, moduleUrl };
+    const out = { ...resolved, moduleUrl };
+    const expireAfterSec = Number(resolved.probeValue?.expire_after ?? 0);
+    if (Number.isFinite(expireAfterSec) && expireAfterSec > 60) {
+      globalThis.__magpieAttestedCache = {
+        cacheKey,
+        expiresAt: Date.now() + Math.min(expireAfterSec - 60, 480) * 1000,
+        resolved: out,
+      };
+    }
+    return out;
   };
 `;
 
@@ -623,6 +642,19 @@ ${buildResolverJs(preferredExports)}
         quotaRejected: true,
         requestedModel: requestModel,
         retrySafe: true,
+        outcome,
+      };
+    }
+    if (
+      outcome === "error" &&
+      !assistantSeen &&
+      /unusual activity/i.test(JSON.stringify(streamError ?? ""))
+    ) {
+      globalThis.__magpieAttestedCache = null;
+      return {
+        error: "ChatGPT Desktop 觸發短暫異常流量保護（rate_limit_exceeded: unusual activity），請稍後再試",
+        stage: "rate_limited",
+        retrySafe: false,
         outcome,
       };
     }
@@ -1130,11 +1162,12 @@ export const evaluateInRenderer = ({
             : retrySafe
               ? "client_not_found"
               : "unknown_send_state");
-        const status = value.quotaRejected
-          ? 429
-          : stage === "context_length_exceeded"
-            ? 413
-            : 502;
+        const status =
+          value.quotaRejected || stage === "rate_limited"
+            ? 429
+            : stage === "context_length_exceeded"
+              ? 413
+              : 502;
         const rawErr =
           typeof value.error === "string" ? value.error.trim() : "";
         fail(
