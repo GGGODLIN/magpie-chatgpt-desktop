@@ -763,60 +763,75 @@ ${buildResolverJs(preferredExports)}
       }
     };
     // 對話已建立但串流斷掉時，用對話編號讀回背景寫完的答案，不白丟這則回答。
-    // 漸長間隔是為了壓低讀取次數，避免讀取本身再被判成異常流量。
+    // 讀取額度整個帳號共用且很緊：2026-10-20 多筆並行撈答案時 GET 大半回 "Too many requests"，
+    // 被拒的讀取似乎也延長限流，連 ChatGPT.app 自己的側欄都讀不到。所以同一時間只讓一筆撈，
+    // 其餘直接放棄交給備援；讀取一被拒就停掉所有撈答案與送出 10 分鐘，讓額度恢復。
     let recoverReads = 0;
-    if (recoverable) {
-      const waits = [3000, 5000, 10000, 15000, 20000, 30000];
-      const startedAt = Date.now();
-      const deadline = startedAt + (options.recoverWithinMs ?? 300000);
-      const readLog = [];
-      while (best === null && Date.now() < deadline) {
-        const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
-        await new Promise((r) => setTimeout(r, wait));
-        // 讀取額度是整個帳號共用的：多筆同時撈答案時各自照時程讀，會撞 GET 的 "Too many requests"
-        // （2026-10-20 實測 10 筆並行時大半讀取被拒、撈回拖到 85～147 秒）。所有讀取共用一條間隔 2 秒的佇列，
-        // 任何一次讀取失敗就讓全部暫停 15 秒。
-        const now = Date.now();
-        const slot = Math.max(now, globalThis.__magpieNextReadAt ?? 0);
-        if (slot > now && slot >= deadline) break;
-        globalThis.__magpieNextReadAt = slot + 2000;
-        if (slot > now) await new Promise((r) => setTimeout(r, slot - now));
-        recoverReads += 1;
-        const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
-        let conversation;
-        try {
-          // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
-          conversation = await Promise.race([
-            client.safeGet("/conversation/" + encodeURIComponent(conversationId), {}),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("read timeout 20s")), 20000)),
-          ]);
-        } catch (error) {
-          entry.thrown = String(error?.message ?? error).slice(0, 200);
-          readLog.push(entry);
-          globalThis.__magpieNextReadAt = Math.max(globalThis.__magpieNextReadAt ?? 0, Date.now() + 15000);
-          continue;
-        }
-        const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
-        entry.nodes = nodes.length;
-        if (nodes.length === 0) entry.raw = JSON.stringify(conversation ?? null).slice(0, 200);
-        entry.assistant = nodes
-          .filter((message) => message.author?.role === "assistant")
-          .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
-        for (const message of nodes) considerMessage(message);
-        entry.found = best !== null;
-        readLog.push(entry);
+    const giveUp = (why, pauseMs) => {
+      if (pauseMs > 0) {
+        globalThis.__magpieReadBlockedUntil = Date.now() + pauseMs;
+        globalThis.__magpieUnusualActivityUntil = Math.max(
+          globalThis.__magpieUnusualActivityUntil ?? 0,
+          Date.now() + pauseMs,
+        );
       }
-      const mine = (globalThis.__magpieStreamDiag ?? []).find((d) => d.conversationId === conversationId);
-      if (mine) mine.reads = readLog.slice(-20);
+      return {
+        error: "ChatGPT Desktop 串流中斷且" + why + "（rate_limit_exceeded），改用其他模型",
+        stage: "rate_limited",
+        retrySafe: true,
+        outcome,
+        conversationId,
+        recoverReads,
+        retryAfterMs: Math.max(pauseMs, 1000),
+      };
+    };
+    if (recoverable) {
+      if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0);
+      if ((globalThis.__magpieRecovering ?? 0) >= 1) return giveUp("已有一筆在撈答案", 0);
+      globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
+      const waits = [5000, 10000, 15000, 20000];
+      const startedAt = Date.now();
+      const deadline = startedAt + (options.recoverWithinMs ?? 90000);
+      const readLog = [];
+      let readRejected = false;
+      try {
+        while (best === null && Date.now() < deadline) {
+          const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
+          await new Promise((r) => setTimeout(r, wait));
+          recoverReads += 1;
+          const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
+          let conversation;
+          try {
+            // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
+            conversation = await Promise.race([
+              client.safeGet("/conversation/" + encodeURIComponent(conversationId), {}),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("read timeout 20s")), 20000)),
+            ]);
+          } catch (error) {
+            entry.thrown = String(error?.message ?? error).slice(0, 200);
+            readLog.push(entry);
+            readRejected = true;
+            break;
+          }
+          const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
+          entry.nodes = nodes.length;
+          if (nodes.length === 0) entry.raw = JSON.stringify(conversation ?? null).slice(0, 200);
+          entry.assistant = nodes
+            .filter((message) => message.author?.role === "assistant")
+            .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
+          for (const message of nodes) considerMessage(message);
+          entry.found = best !== null;
+          readLog.push(entry);
+        }
+      } finally {
+        globalThis.__magpieRecovering = Math.max(0, (globalThis.__magpieRecovering ?? 1) - 1);
+        const mine = (globalThis.__magpieStreamDiag ?? []).find((d) => d.conversationId === conversationId);
+        if (mine) mine.reads = readLog.slice(-20);
+      }
       if (best === null) {
-        return {
-          error: "串流中斷後 " + Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應",
-          stage: "unknown_send_state",
-          retrySafe: false,
-          outcome,
-          conversationId,
-          recoverReads,
-        };
+        return readRejected
+          ? giveUp("讀取被拒", 10 * 60 * 1000)
+          : giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
       }
     }
     if (outcome === "complete") {
@@ -1535,8 +1550,8 @@ export const sendConversation = async ({
         model: selectedModel,
         effort,
         instantFallback: useInstantFallback,
-        // 留 2 分鐘給撈不到答案時 Magpie 換備援，不讓整段先撞外層逾時。
-        recoverWithinMs: Math.max(0, Math.min(300000, timeoutMs - 120000)),
+        // 留 2 分鐘給撈不到答案時 Magpie 換備援，不讓整段先撞外層逾時；控制列直連只等 300 秒，上限壓在 90 秒。
+        recoverWithinMs: Math.max(0, Math.min(90000, timeoutMs - 120000)),
       },
       preferred,
     );
