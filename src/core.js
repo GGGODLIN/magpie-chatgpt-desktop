@@ -565,6 +565,18 @@ ${buildResolverJs(preferredExports)}
     // 前面的 await 期間可能已有別筆被拒收而啟動冷卻，送出前再看一次。
     const blocked = coolingDown();
     if (blocked) return blocked;
+    // 被標記期間每筆送出都會在串流中途被插錯、只能靠撈答案；撈答案名額滿時再送只會白白生成一則
+    // 沒人收的回答（2026-10-20 23:55 三分鐘內 17 筆這樣被丟掉），所以名額滿就不送。
+    const flaggedRecently = Date.now() - (globalThis.__magpieSoftFlagAt ?? 0) < 10 * 60 * 1000;
+    if (flaggedRecently && (globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 1)) {
+      return {
+        error: "ChatGPT Desktop 撈答案名額已滿，暫不送出（rate_limit_exceeded）",
+        stage: "rate_limited",
+        retrySafe: true,
+        outcome: "recovery_busy",
+        retryAfterMs: 30000,
+      };
+    }
 
     const outcome = await new Promise((resolve) => {
       let settled = false;
@@ -787,6 +799,7 @@ ${buildResolverJs(preferredExports)}
       };
     };
     if (recoverable) {
+      globalThis.__magpieSoftFlagAt = Date.now();
       if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0);
       // 同時撈答案的上限與讀取被拒後的暫停長度可在 renderer 直接調，方便實驗不用重新部署。
       if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 1)) {
@@ -1507,7 +1520,6 @@ export const sendConversation = async ({
   WebSocketImpl,
   timeoutMs = 420000,
   targetTimeoutMs = 4000,
-  recoverWithinMs,
   signal,
 } = {}) => {
   const selectedModel = typeof model === "string" ? model.trim() : "";
@@ -1559,7 +1571,7 @@ export const sendConversation = async ({
         instantFallback: useInstantFallback,
         // 背景群組的答案常要 60～150 秒才寫完（2026-10-20 實測 90 秒截掉多筆 in_progress），預設 210 秒；
         // 仍留時間給撈不到時 Magpie 換備援，不讓整段先撞 claude-mem 的 300 秒。
-        recoverWithinMs: Math.max(0, Math.min(recoverWithinMs ?? 210000, timeoutMs - 120000)),
+        recoverWithinMs: Math.max(0, Math.min(210000, timeoutMs - 120000)),
       },
       preferred,
     );

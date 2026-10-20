@@ -580,8 +580,6 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 allowProFallback: true,
                 timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
                 targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
-                // 呼叫端各自的等待上限不同（控制列 300 秒、claude-mem 300 秒），由呼叫端在 metadata 指定撈答案上限。
-                recoverWithinMs: Number(payload?.metadata?.magpie_recover_within_ms) || undefined,
                 signal: init?.signal,
                 onFallbackStart: ({ fallbackId, requestedModel }) => {
                   try {

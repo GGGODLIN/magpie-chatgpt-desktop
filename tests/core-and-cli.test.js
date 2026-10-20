@@ -735,6 +735,29 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     }
   });
 
+  test("被標記期間撈答案名額已滿時不送出", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual" });
+    try {
+      globalThis.__magpieSoftFlagAt = Date.now();
+      globalThis.__magpieRecovering = 1;
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(err?.details?.retryAfterMs).toBe(30000);
+      expect(mock.state.requests.length).toBe(0);
+    } finally {
+      globalThis.__magpieSoftFlagAt = 0;
+      globalThis.__magpieRecovering = 0;
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
   test("沒有建立對話就被 403 拒收時回 429 並冷卻 3 分鐘，不讀對話", async () => {
     const mock = await startMockCdpServer({ kind: "rejected" });
     try {
