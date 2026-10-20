@@ -619,6 +619,20 @@ ${buildResolverJs(preferredExports)}
     };
     events.forEach(findId);
 
+    // 串流開頭會帶 resume_conversation_token；App 靠它在串流中斷後打 /f/conversation/resume 接回同一則回答，
+    // 沒有這張憑證續傳會回 404 tokenless_resume_unavailable（2026-10-21 實測）。
+    let resumeToken = null;
+    for (const rawEv of events) {
+      let data = rawEv?.data ?? rawEv;
+      if (typeof data === "string") {
+        try { data = JSON.parse(data); } catch { continue; }
+      }
+      if (data?.type === "resume_conversation_token" && typeof data.token === "string") {
+        resumeToken = data.token;
+        break;
+      }
+    }
+
     // 只在結構化錯誤欄位遞迴；若外層已有非 model_cap_exceeded 的 code/type（如 rate_limit_exceeded），
     // 不得誤信內層 message 字串中的 model_cap_exceeded 而觸發重送。
     const errorSeen = new Set();
@@ -664,7 +678,11 @@ ${buildResolverJs(preferredExports)}
         streamError: (errorText ?? "").slice(0, 4000),
         recoverWithinMs: options.recoverWithinMs ?? null,
         model: requestModel,
+        hasResumeToken: resumeToken !== null,
       };
+      if (resumeToken !== null && conversationId) {
+        globalThis.__magpieLastResume = { conversationId, token: resumeToken, at: Date.now() };
+      }
       globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-20);
     }
     const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
