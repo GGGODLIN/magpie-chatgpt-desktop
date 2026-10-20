@@ -663,6 +663,7 @@ ${buildResolverJs(preferredExports)}
         eventShapes: events.slice(0, 40).map(describe),
         streamError: (errorText ?? "").slice(0, 4000),
         recoverWithinMs: options.recoverWithinMs ?? null,
+        model: requestModel,
       };
       globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-20);
     }
