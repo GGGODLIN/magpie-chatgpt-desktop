@@ -10,7 +10,7 @@ export const HIGH_PORT_MIN = 58000;
 export const HIGH_PORT_MAX = 65000;
 export const RENDERER_URL = "app://-/index.html";
 export const MAX_PROMPT_BYTES = 500000;
-export const UNUSUAL_ACTIVITY_COOLDOWN_MS = 15 * 60 * 1000;
+export const UNUSUAL_ACTIVITY_COOLDOWN_MS = 3 * 60 * 1000;
 
 let unusualActivityUntil = 0;
 
@@ -510,7 +510,7 @@ export const buildChatExpression = (
   return `(async () => {
   if ((globalThis.__magpieUnusualActivityUntil ?? 0) > Date.now()) {
     return {
-      error: "ChatGPT Desktop 觸發短暫異常流量保護冷卻中（rate_limit_exceeded: unusual activity），請稍後再試",
+      error: "ChatGPT Desktop 拒收後冷卻中（rate_limit_exceeded），請稍後再試",
       stage: "rate_limited",
       retrySafe: true,
       outcome: "cooldown",
@@ -687,22 +687,28 @@ ${buildResolverJs(preferredExports)}
         outcome,
       };
     }
-    const unusualActivity =
+    // 依結構判斷而非錯誤文字：2026-10-20 實測直接拒收是 responseStatus 403、沒有任何串流事件也沒有對話；
+    // 有對話編號的串流錯誤（responseStatus 200、failureOrigin server_stream）回答仍會在背景寫完。
+    let errorObject = streamError;
+    if (typeof errorObject === "string") {
+      try { errorObject = JSON.parse(errorObject); } catch { errorObject = null; }
+    }
+    const rejectedBeforeConversation =
       outcome === "error" &&
+      !conversationId &&
       !assistantSeen &&
-      /unusual activity/i.test(JSON.stringify(streamError ?? ""));
-    const rateLimited = (extra) => {
+      [403, 429].includes(errorObject?.responseStatus);
+    if (rejectedBeforeConversation) {
       globalThis.__magpieAttestedCache = null;
-      globalThis.__magpieUnusualActivityUntil = Date.now() + 15 * 60 * 1000;
+      globalThis.__magpieUnusualActivityUntil = Date.now() + 3 * 60 * 1000;
       return {
-        error: "ChatGPT Desktop 觸發短暫異常流量保護（rate_limit_exceeded: unusual activity），請稍後再試",
+        error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
         stage: "rate_limited",
         retrySafe: true,
         outcome,
-        ...extra,
       };
-    };
-    if (unusualActivity && !conversationId) return rateLimited({});
+    }
+    const recoverable = outcome !== "complete" && errorCode === null;
     if (!conversationId) {
       return {
         error: "串流沒有確認送出狀態",
@@ -765,29 +771,49 @@ ${buildResolverJs(preferredExports)}
         };
       }
     };
-    // 2026-10-20 實測：unusual activity 是伺服器串流中途插入的錯誤（responseStatus 200），
-    // 對話已建立且回答會在背景寫完；用對話編號讀回，就不必白丟這則回答、也不必冷卻。
+    // 對話已建立但串流斷掉時，用對話編號讀回背景寫完的答案，不白丟這則回答。
     // 漸長間隔是為了壓低讀取次數，避免讀取本身再被判成異常流量。
     let recoverReads = 0;
-    if (unusualActivity) {
+    if (recoverable) {
       const waits = [3000, 5000, 10000, 15000, 20000, 30000];
-      const deadline = Date.now() + (options.recoverWithinMs ?? 300000);
+      const startedAt = Date.now();
+      const deadline = startedAt + (options.recoverWithinMs ?? 300000);
+      const readLog = [];
       while (best === null && Date.now() < deadline) {
         const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
         await new Promise((r) => setTimeout(r, wait));
         recoverReads += 1;
+        const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
         let conversation;
         try {
           conversation = await client.safeGet("/conversation/" + encodeURIComponent(conversationId), {});
         } catch (error) {
-          if (/unusual activity/i.test(String(error?.message ?? error))) break;
+          entry.thrown = String(error?.message ?? error).slice(0, 200);
+          readLog.push(entry);
           continue;
         }
-        for (const node of Object.values(conversation?.mapping ?? {})) {
-          considerMessage(node?.message);
-        }
+        const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
+        entry.nodes = nodes.length;
+        if (nodes.length === 0) entry.raw = JSON.stringify(conversation ?? null).slice(0, 200);
+        entry.assistant = nodes
+          .filter((message) => message.author?.role === "assistant")
+          .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
+        for (const message of nodes) considerMessage(message);
+        entry.found = best !== null;
+        readLog.push(entry);
       }
-      if (best === null) return rateLimited({ conversationId, recoverReads });
+      const last = (globalThis.__magpieStreamDiag ?? []).at(-1);
+      if (last?.conversationId === conversationId) last.reads = readLog.slice(-20);
+      if (best === null) {
+        return {
+          error: "串流中斷後 " + Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應",
+          stage: "unknown_send_state",
+          retrySafe: false,
+          outcome,
+          conversationId,
+          recoverReads,
+        };
+      }
     }
     if (outcome === "complete") {
       for (const rawEv of events) {
@@ -800,7 +826,7 @@ ${buildResolverJs(preferredExports)}
         if (msgCandidate) considerMessage(msgCandidate);
       }
     }
-    if (!unusualActivity && (outcome !== "complete" || best === null)) {
+    if (!recoverable && (outcome !== "complete" || best === null)) {
       const conversation = await client.safeGet(
         \`/conversation/\${encodeURIComponent(conversationId)}\`,
         {},
@@ -825,7 +851,7 @@ ${buildResolverJs(preferredExports)}
       model: best.model,
       requestedModel: requestModel,
       conversationId,
-      outcome: unusualActivity ? "recovered" : outcome,
+      outcome: recoverable ? "recovered" : outcome,
       recoverReads,
       eventCount: events.length,
       clientExport: resolved.exportName,
@@ -1472,7 +1498,7 @@ export const sendConversation = async ({
 
   if (Date.now() < unusualActivityUntil) {
     throw new ChatGPTDesktopError(
-      "ChatGPT Desktop 觸發短暫異常流量保護冷卻中（rate_limit_exceeded: unusual activity），請稍後再試",
+      "ChatGPT Desktop 拒收後冷卻中（rate_limit_exceeded），請稍後再試",
       {
         stage: "rate_limited",
         retrySafe: true,

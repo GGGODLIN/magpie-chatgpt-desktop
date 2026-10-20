@@ -50,7 +50,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
         return `ChatGPT Desktop 模型配額已滿（Quota exceeded: model_cap_exceeded, resets at ${resetIso} UTC+0, please switch to the other models）。如需自動退回 Instant 模型，請開啟供應商設定的「instant_fallback」開關。`;
       }
       case "rate_limited":
-        return "ChatGPT Desktop 觸發短暫異常流量保護（Rate limit exceeded: unusual activity, try again in 15m）。";
+        return "ChatGPT Desktop 拒收請求、暫停 3 分鐘（Rate limit exceeded: rejected before conversation, try again in 3m）。";
       case "unknown_send_state":
         return "ChatGPT Desktop 對話請求已送出但連線中斷或未確認完成狀態（Unknown send state）；為避免重複扣額，請勿自動重送。";
       default:
@@ -739,7 +739,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     status: 429,
                     headers: {
                       "content-type": "application/json",
-                      "Retry-After": "900",
+                      "Retry-After": "180",
                     },
                   },
                 );
