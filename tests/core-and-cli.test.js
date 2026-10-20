@@ -648,6 +648,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
   });
 
   test("對話已建立但串流中斷時用對話編號讀回已寫完的答案，不啟動冷卻", async () => {
+    globalThis.__magpieNextReadAt = 0;
     const mock = await startMockCdpServer({ kind: "unusual", answer: "recovered answer" });
     try {
       const chat = await sendConversation({
@@ -670,6 +671,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
   });
 
   test("對話已建立但期限內讀不到完成答案時回 unknown_send_state，不啟動冷卻", async () => {
+    globalThis.__magpieNextReadAt = 0;
     const mock = await startMockCdpServer({ kind: "unusual", emptyConversation: true });
     try {
       let err = null;
@@ -690,6 +692,24 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     } finally {
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("撈答案的讀取失敗時讓所有讀取一起暫停 15 秒", async () => {
+    globalThis.__magpieNextReadAt = 0;
+    const mock = await startMockCdpServer({ kind: "unusual", throwEmptyErrorOnConversationGet: true });
+    try {
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", timeoutMs: 121000 });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.stage).toBe("unknown_send_state");
+      expect(globalThis.__magpieNextReadAt - Date.now()).toBeGreaterThan(10 * 1000);
+    } finally {
+      globalThis.__magpieNextReadAt = 0;
       mock.stop();
     }
   });

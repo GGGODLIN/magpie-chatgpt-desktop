@@ -651,7 +651,7 @@ ${buildResolverJs(preferredExports)}
         eventShapes: events.slice(0, 40).map(describe),
         streamError: (errorText ?? "").slice(0, 4000),
       };
-      globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-5);
+      globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-20);
     }
     const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
     if (
@@ -773,6 +773,14 @@ ${buildResolverJs(preferredExports)}
       while (best === null && Date.now() < deadline) {
         const wait = Math.min(waits[Math.min(recoverReads, waits.length - 1)], deadline - Date.now());
         await new Promise((r) => setTimeout(r, wait));
+        // 讀取額度是整個帳號共用的：多筆同時撈答案時各自照時程讀，會撞 GET 的 "Too many requests"
+        // （2026-10-20 實測 10 筆並行時大半讀取被拒、撈回拖到 85～147 秒）。所有讀取共用一條間隔 2 秒的佇列，
+        // 任何一次讀取失敗就讓全部暫停 15 秒。
+        const now = Date.now();
+        const slot = Math.max(now, globalThis.__magpieNextReadAt ?? 0);
+        if (slot > now && slot >= deadline) break;
+        globalThis.__magpieNextReadAt = slot + 2000;
+        if (slot > now) await new Promise((r) => setTimeout(r, slot - now));
         recoverReads += 1;
         const entry = { s: Math.round((Date.now() - startedAt) / 1000) };
         let conversation;
@@ -785,6 +793,7 @@ ${buildResolverJs(preferredExports)}
         } catch (error) {
           entry.thrown = String(error?.message ?? error).slice(0, 200);
           readLog.push(entry);
+          globalThis.__magpieNextReadAt = Math.max(globalThis.__magpieNextReadAt ?? 0, Date.now() + 15000);
           continue;
         }
         const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
