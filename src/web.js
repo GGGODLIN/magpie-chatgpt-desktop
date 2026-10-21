@@ -141,8 +141,12 @@ export const sendWebConversation = async ({
     })).result?.targetId;
     if (!targetId) throw unavailable("公司網頁版開不了分頁", "cdp_unreachable");
     const sessionId = (await cdp.send("Target.attachToTarget", { targetId, flatten: true })).result.sessionId;
+    // 頁面卡住（例如沒登入的新設定檔停在 Cloudflare 驗證頁）時不能無限等：2026-10-21 一筆因此卡滿 4 分鐘。
     const evaluate = async (expression) => {
-      const reply = await cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId);
+      const reply = await Promise.race([
+        cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId),
+        sleep(30000).then(() => { throw unavailable("公司網頁版頁面 30 秒沒回應", "renderer_timeout"); }),
+      ]);
       if (reply.result?.exceptionDetails) throw unavailable("公司網頁版頁面執行失敗：" + String(reply.result.exceptionDetails.exception?.description ?? "").slice(0, 200), "renderer_timeout");
       return reply.result?.result?.value;
     };
