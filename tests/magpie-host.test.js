@@ -407,7 +407,7 @@ describe("Ticket 02 — 真實 Magpie Bun 外掛宿主整合測試", () => {
         plugins: [
           {
             spec: "magpie-chatgpt-desktop",
-            provides: ["chatgpt-desktop"],
+            provides: ["chatgpt-web-biz", "chatgpt-desktop"],
           },
         ],
       });

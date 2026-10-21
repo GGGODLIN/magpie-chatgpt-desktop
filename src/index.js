@@ -816,3 +816,6 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
   };
 }
 
+
+// Magpie 會把每個匯出的函式各載成一個 provider：公司帳號網頁版與桌面版共用同一個套件。
+export { chatgptWebBizPlugin } from "./web.js";
