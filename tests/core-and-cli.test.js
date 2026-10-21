@@ -935,6 +935,8 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(err?.status).toBe(429);
       expect(mock.state.requests.length).toBe(1);
       expect(err?.details?.retryAfterMs).toBeGreaterThan(22.9 * 60 * 60 * 1000);
+      await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", dailyBudget: 3 });
+      expect(mock.state.requests.length).toBe(2);
     } finally {
       if (hadStorage) globalThis.localStorage = previous;
       else delete globalThis.localStorage;

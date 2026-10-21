@@ -1708,7 +1708,8 @@ export const sendConversation = async ({
   try {
     result = await sendOnce(false);
   } catch (error) {
-    if (error?.stage === "rate_limited") {
+    // 自家每日預算每次送出前都會重查；記進程序冷卻的話，調高預算後要等到原本的解鎖時間才生效（2026-10-21 白話被卡到凌晨）。
+    if (error?.stage === "rate_limited" && error?.details?.outcome !== "daily_budget") {
       unusualActivityUntil = Date.now() + (error?.details?.retryAfterMs ?? UNUSUAL_ACTIVITY_COOLDOWN_MS);
     }
     const details = error?.details ?? {};
