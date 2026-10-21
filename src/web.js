@@ -9,8 +9,10 @@ import path from "node:path";
 import { ChatGPTDesktopError, formatMessagesToPrompt, normalizeThinkingEffort } from "./core.js";
 
 export const WEB_DEFAULT_PORT = 19444;
-// Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；用系統帳號的家目錄。
-const WEB_HOME = path.join(os.userInfo().homedir, ".local/share/chatgpt-web-biz");
+// Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；Bun 的
+// os.userInfo().homedir 也跟著 HOME 走（Node 不會），所以用帳號名稱組 macOS 家目錄。
+const WEB_HOME = process.env.CHATGPT_WEB_BIZ_HOME
+  ?? path.join("/Users", os.userInfo().username, ".local/share/chatgpt-web-biz");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEB_MODELS = [
   { slug: "gpt-6-thinking", name: "GPT-6 Thinking (web)", reasoning: true, context: 262144 },
