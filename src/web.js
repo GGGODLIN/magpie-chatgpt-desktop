@@ -122,7 +122,8 @@ export const sendWebConversation = async ({
   model = "gpt-6-thinking",
   effort,
   timeoutMs = 420000,
-  dailyBudget = 200,
+  // 預設不設上限（使用者 2026-10-21 要先觀察真實用量）；sends.json 照常記錄，要恢復上限就傳數字。
+  dailyBudget = null,
   budgetFile = path.join(WEB_HOME, "sends.json"),
   signal,
 }) => {
@@ -347,7 +348,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
                 model: payload.model,
                 effort,
                 timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
-                dailyBudget: pluginOptions?.dailyBudget ?? 200,
+                dailyBudget: pluginOptions?.dailyBudget ?? null,
                 signal: init?.signal,
               });
               const id = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
