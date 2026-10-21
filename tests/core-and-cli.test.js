@@ -204,10 +204,13 @@ const startMockCdpServer = async (scenario = {}) => {
             `        return catalog;`,
             `      }`,
             `      if (path.endsWith("/stream_status")) {`,
-            `        if (scenario.statusThrows) throw new Error("Too many requests");`,
+            `        if (scenario.statusThrows) throw Object.assign(new Error("Too many requests"), { status: 429 });`,
             `        const seq = scenario.streamStatuses ?? ["COMPLETE"];`,
             `        const n = globalThis.__testReads.filter((p) => p === path).length;`,
             `        return { status: seq[Math.min(n - 1, seq.length - 1)] };`,
+            `      }`,
+            `      if (scenario.conversationGetStatus) {`,
+            `        throw Object.assign(new Error("conversation get failed"), { status: scenario.conversationGetStatus });`,
             `      }`,
             `      if (scenario.throwEmptyErrorOnConversationGet) {`,
             `        throw new Error("");`,
@@ -714,7 +717,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
   });
 
   test("撈答案的讀取被拒時停掉撈答案與送出 10 分鐘", async () => {
-    const mock = await startMockCdpServer({ kind: "unusual", throwEmptyErrorOnConversationGet: true });
+    const mock = await startMockCdpServer({ kind: "unusual", conversationGetStatus: 429 });
     try {
       let err = null;
       try {
@@ -727,6 +730,27 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(globalThis.__magpieUnusualActivityUntil - Date.now()).toBeGreaterThan(9 * 60 * 1000);
     } finally {
       globalThis.__magpieReadBlockedUntil = 0;
+      globalThis.__magpieUnusualActivityUntil = 0;
+      resetUnusualActivityCooldown();
+      mock.stop();
+    }
+  });
+
+  test("讀對話回 404（對話已壞）時只放棄這一筆，不暫停撈答案與送出", async () => {
+    const mock = await startMockCdpServer({ kind: "unusual", conversationGetStatus: 404 });
+    try {
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: mock.cdpUrl, prompt: "hi", model: "gpt-6-thinking", timeoutMs: 121000 });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.status).toBe(429);
+      expect(globalThis.__magpieReadBlockedUntil ?? 0).toBeLessThan(Date.now());
+      expect(err?.details?.retryAfterMs).toBeLessThanOrEqual(30000);
+    } finally {
+      globalThis.__magpieReadBlockedUntil = 0;
+      globalThis.__magpieSoftFlagAt = 0;
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();
       mock.stop();

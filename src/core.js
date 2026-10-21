@@ -892,6 +892,10 @@ ${buildResolverJs(preferredExports)}
       let statusPolls = 0;
       let statusErrors = 0;
       let lastStatus = null;
+      let unreadable = false;
+      // 只有 HTTP 429 才算讀取限流、要全體暫停；2026-10-21 長回答被插「something seems to have gone wrong」後
+      // 讀對話回 404 conversation_inaccessible，被當成限流整個暫停 10 分鐘兩次，30 分鐘停擺 20 分鐘。
+      const isThrottled = (error) => Number(error?.status ?? error?.responseStatus) === 429;
       try {
         while (best === null && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, Math.min(statusGapMs, deadline - Date.now())));
@@ -906,8 +910,9 @@ ${buildResolverJs(preferredExports)}
             statusErrors = 0;
           } catch (error) {
             statusErrors += 1;
-            readLog.push({ s: elapsed, statusThrown: String(error?.message ?? error).slice(0, 200) });
-            if (statusErrors >= 3) { readRejected = true; break; }
+            readLog.push({ s: elapsed, statusThrown: String(error?.message ?? error).slice(0, 200), httpStatus: error?.status ?? null });
+            if (isThrottled(error) && statusErrors >= 3) { readRejected = true; break; }
+            if (statusErrors >= 3) break;
             continue;
           }
           if (status !== lastStatus) readLog.push({ s: elapsed, status });
@@ -926,8 +931,10 @@ ${buildResolverJs(preferredExports)}
               );
             } catch (error) {
               entry.thrown = String(error?.message ?? error).slice(0, 200);
+              entry.httpStatus = error?.status ?? null;
               readLog.push(entry);
-              readRejected = true;
+              if (isThrottled(error)) readRejected = true;
+              else unreadable = true;
               break;
             }
             const nodes = Object.values(conversation?.mapping ?? {}).map((node) => node?.message).filter(Boolean);
@@ -941,7 +948,7 @@ ${buildResolverJs(preferredExports)}
           }
           // 串流已結束卻沒有完稿：2026-10-21 實測 gpt-6-instant 長回答會停在 in_progress、stream_status 卻報 COMPLETE，
           // 之後再也不會寫完，不必再等。
-          if (best === null && !readRejected) stalled = true;
+          if (best === null && !readRejected && !unreadable) stalled = true;
           break;
         }
       } finally {
@@ -954,6 +961,7 @@ ${buildResolverJs(preferredExports)}
       }
       if (best === null) {
         if (readRejected) return giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000);
+        if (unreadable) return giveUp("對話讀不到（這一筆放棄、不暫停）", 0);
         if (stalled) return giveUp("回答停在半截（串流狀態 " + lastStatus + "）", 0);
         return giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
       }
