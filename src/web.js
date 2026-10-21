@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ChatGPTDesktopError, formatMessagesToPrompt, normalizeThinkingEffort } from "./core.js";
+import { ChatGPTDesktopError, estimateTokenCount, formatMessagesToPrompt, normalizeThinkingEffort } from "./core.js";
 
 export const WEB_DEFAULT_PORT = 19444;
 // Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；Bun 的
@@ -245,7 +245,13 @@ export const sendWebConversation = async ({
       if (reply.status !== 200) throw rateLimited(`公司網頁版讀不到對話（HTTP ${reply.status}）`, 30000);
       const answer = extractFinalAnswer(JSON.parse(reply.body));
       if (answer?.status === "finished_successfully" && answer.text) {
-        return { answer: answer.text, model: answer.model ?? model, conversationId, streamStatus, ms: Date.now() - started };
+        // 網頁版不回 token 數，跟桌面版一樣用字元估算，讓 Magpie 的用量紀錄量得到公司帳號接了多少。
+        const promptTokens = estimateTokenCount(prompt);
+        const completionTokens = estimateTokenCount(answer.text);
+        return {
+          answer: answer.text, model: answer.model ?? model, conversationId, streamStatus, ms: Date.now() - started,
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+        };
       }
       await sleep(5000);
     }
@@ -338,7 +344,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
               const id = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);
               if (payload.stream === true) {
-                const chunk = (delta, finish) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: result.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+                const chunk = (delta, finish) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: result.model, choices: [{ index: 0, delta, finish_reason: finish }], ...(finish ? { usage: result.usage } : {}) })}\n\n`;
                 return new Response(chunk({ role: "assistant", content: result.answer }, null) + chunk({}, "stop") + "data: [DONE]\n\n", {
                   status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
                 });
@@ -346,6 +352,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
               return new Response(JSON.stringify({
                 id, object: "chat.completion", created, model: result.model,
                 choices: [{ index: 0, message: { role: "assistant", content: result.answer }, finish_reason: "stop" }],
+                usage: result.usage,
               }), { status: 200, headers: { "content-type": "application/json" } });
             } catch (error) {
               return errorResponse(error);
