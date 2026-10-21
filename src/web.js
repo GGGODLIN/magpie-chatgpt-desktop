@@ -132,9 +132,12 @@ export const sendWebConversation = async ({
   const started = Date.now();
   let targetId = null;
   try {
-    // 獨立視窗：背景分頁不會渲染，找不到輸入框（2026-10-21 實測）。
+    // 每筆在常駐視窗裡開背景分頁：沒有任何視窗時 Chrome 會為分頁新開視窗、送完關掉，畫面一直閃；
+    // 所以先留一個常駐視窗讓使用者自己縮到最小（加了不節流參數，背景分頁與最小化都照常渲染，2026-10-21 實測）。
+    const pages = ((await cdp.send("Target.getTargets")).result?.targetInfos ?? []).filter((t) => t.type === "page");
+    if (pages.length === 0) await cdp.send("Target.createTarget", { url: "about:blank", newWindow: true });
     targetId = (await cdp.send("Target.createTarget", {
-      url: "https://chatgpt.com/?temporary-chat=true", newWindow: true, left: -2400, top: 0, width: 900, height: 800,
+      url: "https://chatgpt.com/?temporary-chat=true", background: true,
     })).result?.targetId;
     if (!targetId) throw unavailable("公司網頁版開不了分頁", "cdp_unreachable");
     const sessionId = (await cdp.send("Target.attachToTarget", { targetId, flatten: true })).result.sessionId;
