@@ -23,7 +23,8 @@ const WEB_MODELS = [
 // 網頁版只能從畫面送出（送出前要 sentinel 運算量證明與 Turnstile，由頁面自己產生）；
 // 畫面上只打一個佔位字元，再在網路層換成真正的 prompt、模型與思考強度，免得把長文打進輸入框。
 export const rewriteConversationBody = (body, { prompt, model, effort }) => {
-  const out = { ...body, model: model ?? body.model };
+  // 不能只靠 ?temporary-chat=true：2026-10-21 公司帳號側邊欄出現背景請求留下的一般對話，頁面送出的內容並不一定帶暫時旗標。
+  const out = { ...body, model: model ?? body.model, history_and_training_disabled: true, is_do_not_remember: true };
   out.messages = (body.messages ?? []).map((message, index) =>
     index === 0 ? { ...message, content: { ...message.content, content_type: "text", parts: [prompt] } } : message);
   delete out.thinking_effort;

@@ -24,6 +24,13 @@ describe("rewriteConversationBody", () => {
     expect("thinking_effort" in out).toBe(false);
   });
 
+  test("forces temporary-chat flags even when the page did not set them", () => {
+    const { history_and_training_disabled: _, ...body } = pageBody();
+    const out = rewriteConversationBody(body, { prompt: "p", model: "gpt-6-thinking", effort: "high" });
+    expect(out.history_and_training_disabled).toBe(true);
+    expect(out.is_do_not_remember).toBe(true);
+  });
+
   test("does not mutate the page body", () => {
     const body = pageBody();
     rewriteConversationBody(body, { prompt: "p", model: "gpt-6-thinking", effort: "low" });
