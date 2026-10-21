@@ -1022,6 +1022,7 @@ describe("Ticket 01 — 多輪對話與系統提示折疊、非文字附件送�
         "[System]\nYou are a concise architect.\n\n[User]\nFirst question\n\n[Assistant]\nFirst reply\n\n[User]\nFollow-up question",
       );
       expect(mock.state.requests[0].is_do_not_remember).toBe(true);
+      expect(mock.state.requests[0].history_and_training_disabled).toBe(true);
     } finally {
       mock.stop();
     }

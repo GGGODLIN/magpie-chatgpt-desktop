@@ -540,6 +540,9 @@ ${buildResolverJs(preferredExports)}
     const body = {
       action: "next",
       is_do_not_remember: true,
+      // 暫時對話：背景請求不進側邊欄，免得淹沒本人的對話紀錄；2026-10-21 實測暫時對話仍有
+      // conversation_id，stream_status 與 GET /conversation/{id} 都照常可讀，撈答案不受影響。
+      history_and_training_disabled: true,
       messages: [{
         author: { role: "user" },
         channel: null,
