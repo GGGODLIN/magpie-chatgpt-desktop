@@ -11,8 +11,8 @@ import { ChatGPTDesktopError, estimateTokenCount, formatMessagesToPrompt, normal
 export const WEB_DEFAULT_PORT = 19444;
 // Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；Bun 的
 // os.userInfo().homedir 也跟著 HOME 走（Node 不會），所以用帳號名稱組 macOS 家目錄。
-const WEB_HOME = process.env.CHATGPT_WEB_BIZ_HOME
-  ?? path.join("/Users", os.userInfo().username, ".local/share/chatgpt-web-biz");
+const REAL_HOME = path.join("/Users", os.userInfo().username);
+const WEB_HOME = process.env.CHATGPT_WEB_BIZ_HOME ?? path.join(REAL_HOME, ".local/share/chatgpt-web-biz");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEB_MODELS = [
   { slug: "gpt-6-thinking", name: "GPT-6 Thinking (web)", reasoning: true, context: 262144 },
@@ -82,7 +82,9 @@ const ensureBrowser = async ({ cdpUrl, launcher }) => {
   if (!launcher || !fs.existsSync(launcher)) {
     throw unavailable("公司網頁版 Chrome 沒開，也找不到啟動腳本（CDP unreachable）", "cdp_unreachable");
   }
-  spawn(launcher, [], { detached: true, stdio: "ignore" }).unref();
+  // Chrome 靠 $HOME 找登入鑰匙圈解 cookie；用宿主改過的 HOME 啟動會解不開、整個設定檔等於被登出
+  // （2026-10-21 實際把公司帳號登入弄丟過一次）。啟動腳本也會自己改回，這裡再保一層。
+  spawn(launcher, [], { detached: true, stdio: "ignore", env: { ...process.env, HOME: REAL_HOME } }).unref();
   for (let i = 0; i < 20; i++) {
     await sleep(1000);
     try { return await browserVersion(cdpUrl); } catch {}
