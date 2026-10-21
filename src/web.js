@@ -9,6 +9,8 @@ import path from "node:path";
 import { ChatGPTDesktopError, formatMessagesToPrompt, normalizeThinkingEffort } from "./core.js";
 
 export const WEB_DEFAULT_PORT = 19444;
+// Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；用系統帳號的家目錄。
+const WEB_HOME = path.join(os.userInfo().homedir, ".local/share/chatgpt-web-biz");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEB_MODELS = [
   { slug: "gpt-6-thinking", name: "GPT-6 Thinking (web)", reasoning: true, context: 262144 },
@@ -110,14 +112,14 @@ const openSession = async (wsUrl) => {
 
 export const sendWebConversation = async ({
   cdpUrl = `http://127.0.0.1:${WEB_DEFAULT_PORT}`,
-  launcher = path.join(os.homedir(), ".local/share/chatgpt-web-biz/launch.sh"),
+  launcher = path.join(WEB_HOME, "launch.sh"),
   expectedEmail,
   prompt,
   model = "gpt-6-thinking",
   effort,
   timeoutMs = 420000,
   dailyBudget = 200,
-  budgetFile = path.join(os.homedir(), ".local/share/chatgpt-web-biz/sends.json"),
+  budgetFile = path.join(WEB_HOME, "sends.json"),
   signal,
 }) => {
   const budget = checkDailyBudget(readSends(budgetFile), dailyBudget);
@@ -268,7 +270,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
   const expectedEmail = () => {
     if (pluginOptions?.expectedEmail) return pluginOptions.expectedEmail;
     try {
-      return JSON.parse(fs.readFileSync(path.join(os.homedir(), ".local/share/chatgpt-web-biz/account.json"), "utf8")).email ?? null;
+      return JSON.parse(fs.readFileSync(path.join(WEB_HOME, "account.json"), "utf8")).email ?? null;
     } catch { return null; }
   };
   const modelEntries = Object.fromEntries(WEB_MODELS.map((m) => [m.slug, {
@@ -301,7 +303,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
             method: "auto",
             async callback() {
               try {
-                await ensureBrowser({ cdpUrl, launcher: pluginOptions?.launcher ?? path.join(os.homedir(), ".local/share/chatgpt-web-biz/launch.sh") });
+                await ensureBrowser({ cdpUrl, launcher: pluginOptions?.launcher ?? path.join(WEB_HOME, "launch.sh") });
                 return { type: "success", refresh: cdpUrl, access: cdpUrl, expires: 0, accountId: expectedEmail() ?? "ChatGPT Web" };
               } catch (error) {
                 return { type: "failed", error: String(error?.message ?? error) };
