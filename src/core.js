@@ -497,6 +497,7 @@ export const buildChatExpression = (
     return {
       error: "ChatGPT Desktop 送出間隔冷卻中（rate_limit_exceeded），請稍後再試",
       stage: "rate_limited",
+      accountCooldown: true,
       retrySafe: true,
       outcome: "cooldown",
       retryAfterMs: waitMs,
@@ -670,10 +671,13 @@ ${buildResolverJs(preferredExports)}
       }
       if (!value || typeof value !== "object" || errorSeen.has(value)) return null;
       errorSeen.add(value);
-      const allowed = ["model_cap_exceeded", "input_too_large", "message_length_exceeds_limit"];
+      const allowed = ["model_cap_exceeded", "usage_limit", "input_too_large", "message_length_exceeds_limit"];
       if (typeof value.code === "string") return allowed.includes(value.code) ? value.code : null;
-      if (typeof value. errorCode === "string") return allowed.includes(value.errorCode) ? value.errorCode : null;
-      if (typeof value.type === "string") return allowed.includes(value.type) ? value.type : null;
+      if (typeof value.errorCode === "string") return allowed.includes(value.errorCode) ? value.errorCode : null;
+      if (typeof value.error_code === "string") return allowed.includes(value.error_code) ? value.error_code : null;
+      if (typeof value.type === "string" && value.type !== "fetch-stream-error") {
+        return allowed.includes(value.type) ? value.type : null;
+      }
       for (const key of ["error", "detail", "data", "body", "message"]) {
         const code = recognizedErrorCode(value[key]);
         if (code) return code;
@@ -727,13 +731,56 @@ ${buildResolverJs(preferredExports)}
         outcome,
       };
     }
-    if (errorCode === "model_cap_exceeded" && !conversationId && !assistantSeen) {
+    if (
+      (errorCode === "usage_limit" && !assistantSeen) ||
+      (errorCode === "model_cap_exceeded" && !conversationId && !assistantSeen)
+    ) {
+      let resetsAt = null;
+      const limitedModels = {};
+      const recordReset = (slug, rawIso) => {
+        const parsed = Date.parse(rawIso ?? "");
+        if (!Number.isFinite(parsed) || parsed <= Date.now()) return;
+        const iso = new Date(parsed).toISOString();
+        if (slug) limitedModels[slug] = iso;
+        if (!resetsAt || parsed > Date.parse(resetsAt)) resetsAt = iso;
+      };
+      let errObj = streamError;
+      if (typeof errObj === "string") {
+        try { errObj = JSON.parse(errObj); } catch { errObj = null; }
+      }
+      recordReset(requestModel, errObj?.resets_after ?? errObj?.error?.resets_after ?? errObj?.detail?.resets_after);
+      try {
+        const init = await client.safePost("/conversation/init", {
+          requestBody: {
+            conversation_id: null,
+            conversation_origin: null,
+            gizmo_id: null,
+            requested_default_model: requestModel,
+            system_hints: null,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timezone_offset_min: new Date().getTimezoneOffset(),
+          },
+        });
+        for (const item of init?.model_limits ?? []) {
+          if (typeof item?.model_slug === "string") {
+            recordReset(item.model_slug, item.resets_after);
+          }
+        }
+        const blockedFeature = (init?.blocked_features ?? []).find((f) => f?.name && f.name !== "send");
+        recordReset(requestModel, blockedFeature?.resets_after ?? init?.banner_info?.resets_after);
+      } catch {}
+      if (resetsAt && !limitedModels[requestModel]) {
+        limitedModels[requestModel] = resetsAt;
+      }
+      const retryAfterMs = resetsAt ? Math.max(1000, Date.parse(resetsAt) - Date.now()) : undefined;
       return {
         error: "模型配額明確拒絕本次請求",
         stage: "quota_exceeded",
         errorCode,
         quotaRejected: true,
         requestedModel: requestModel,
+        ...(resetsAt ? { resetsAt, retryAfterMs } : {}),
+        ...(Object.keys(limitedModels).length > 0 ? { limitedModels } : {}),
         retrySafe: true,
         outcome,
       };
@@ -775,6 +822,7 @@ ${buildResolverJs(preferredExports)}
       return {
         error: "ChatGPT Desktop 拒收請求（rate_limit_exceeded: HTTP " + errorObject.responseStatus + "），請稍後再試",
         stage: "rate_limited",
+        accountCooldown: true,
         retrySafe: true,
         outcome,
         retryAfterMs: until - Date.now(),
@@ -843,12 +891,21 @@ ${buildResolverJs(preferredExports)}
         };
       }
     };
+    for (const rawEv of events) {
+      let ev = rawEv;
+      if (typeof ev === "string") {
+        try { ev = JSON.parse(ev); } catch { ev = null; }
+      }
+      const msgCandidate =
+        ev?.data?.message ?? ev?.data?.v?.message ?? ev?.message ?? null;
+      if (msgCandidate) considerMessage(msgCandidate);
+    }
     // 對話已建立但串流斷掉時，用對話編號讀回背景寫完的答案，不白丟這則回答。
     // 讀取額度整個帳號共用且很緊：2026-10-20 多筆並行撈答案時 GET 大半回 "Too many requests"，
     // 被拒的讀取似乎也延長限流，連 ChatGPT.app 自己的側欄都讀不到。所以同一時間只讓一筆撈，
     // 其餘直接放棄交給備援；讀取一被拒就停掉所有撈答案與送出 10 分鐘，讓額度恢復。
     let recoverReads = 0;
-    const giveUp = (why, pauseMs) => {
+    const giveUp = (why, pauseMs, accountCooldown = pauseMs > 0) => {
       if (pauseMs > 0) {
         globalThis.__magpieReadBlockedUntil = Date.now() + pauseMs;
         globalThis.__magpieUnusualActivityUntil = Math.max(
@@ -859,6 +916,7 @@ ${buildResolverJs(preferredExports)}
       return {
         error: "ChatGPT Desktop 串流中斷且" + why + "（rate_limit_exceeded），改用其他模型",
         stage: "rate_limited",
+        accountCooldown,
         retrySafe: true,
         outcome,
         conversationId,
@@ -868,13 +926,13 @@ ${buildResolverJs(preferredExports)}
         retryAfterMs: Math.max(pauseMs, 30000),
       };
     };
-    if (recoverable) {
+    if (recoverable && best === null) {
       globalThis.__magpieSoftFlagAt = Date.now();
-      if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0);
+      if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0, true);
       // 同時撈答案的上限與讀取被拒後的暫停長度可在 renderer 直接調，方便實驗不用重新部署。
       // 預設 2：2026-10-21 模擬同時 2 筆 30 分鐘 44/45 成功、GET 0 次被拒；同時 3 筆 20 分鐘就撞到 24 小時上限。
       if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 2)) {
-        return giveUp("撈答案名額已滿", 0);
+        return giveUp("撈答案名額已滿", 0, false);
       }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
       // 整段對話的 GET 額度很緊（2026-10-20 實測約 6 分半 23 次就被限流），但 App 自己續傳前用的
@@ -921,9 +979,13 @@ ${buildResolverJs(preferredExports)}
           if (status !== lastStatus) readLog.push({ s: elapsed, status });
           lastStatus = status;
           if (status === "IS_STREAMING") continue;
-          // 剛轉 COMPLETE 時正文偶爾還沒落進 mapping，讀到仍在寫就隔一輪再讀一次，最多兩次 GET。
+          // 剛轉 COMPLETE 時正文偶爾還沒落進 mapping，隔一輪再讀一次，最多兩次 GET。
           for (let attempt = 0; attempt < 2 && best === null; attempt += 1) {
-            if (attempt > 0) await new Promise((r) => setTimeout(r, statusGapMs));
+            if (attempt > 0) {
+              const remainMs = deadline - Date.now();
+              if (remainMs <= 0) break;
+              await new Promise((r) => setTimeout(r, Math.min(statusGapMs, remainMs)));
+            }
             recoverReads += 1;
             const entry = { s: Math.round((Date.now() - startedAt) / 1000), read: true };
             let conversation;
@@ -947,7 +1009,6 @@ ${buildResolverJs(preferredExports)}
             for (const message of nodes) considerMessage(message);
             entry.found = best !== null;
             readLog.push(entry);
-            if (!nodes.some((m) => m.author?.role === "assistant" && m.status === "in_progress")) break;
           }
           // 串流已結束卻沒有完稿：2026-10-21 實測 gpt-6-instant 長回答會停在 in_progress、stream_status 卻報 COMPLETE，
           // 之後再也不會寫完，不必再等。
@@ -963,21 +1024,10 @@ ${buildResolverJs(preferredExports)}
         }
       }
       if (best === null) {
-        if (readRejected) return giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000);
-        if (unreadable) return giveUp("對話讀不到（這一筆放棄、不暫停）", 0);
-        if (stalled) return giveUp("回答停在半截（串流狀態 " + lastStatus + "）", 0);
-        return giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0);
-      }
-    }
-    if (outcome === "complete") {
-      for (const rawEv of events) {
-        let ev = rawEv;
-        if (typeof ev === "string") {
-          try { ev = JSON.parse(ev); } catch { ev = null; }
-        }
-        const msgCandidate =
-          ev?.data?.message ?? ev?.data?.v?.message ?? ev?.message ?? null;
-        if (msgCandidate) considerMessage(msgCandidate);
+        if (readRejected) return giveUp("讀取被拒", globalThis.__magpieReadPauseMs ?? 10 * 60 * 1000, true);
+        if (unreadable) return giveUp("對話讀不到（這一筆放棄、不暫停）", 0, false);
+        if (stalled) return giveUp("回答停在半截（串流狀態 " + lastStatus + "）", 0, false);
+        return giveUp(Math.round((Date.now() - startedAt) / 1000) + " 秒內讀不到完成的回應", 0, false);
       }
     }
     if (!recoverable && (outcome !== "complete" || best === null)) {
@@ -1708,8 +1758,8 @@ export const sendConversation = async ({
   try {
     result = await sendOnce(false);
   } catch (error) {
-    // 自家每日預算每次送出前都會重查；記進程序冷卻的話，調高預算後要等到原本的解鎖時間才生效（2026-10-21 白話被卡到凌晨）。
-    if (error?.stage === "rate_limited" && error?.details?.outcome !== "daily_budget") {
+    // 只有真正全帳號限流（被拒收或讀取 429）才記進程序冷卻；單筆卡住、讀不到或自家每日預算不冷凍整個帳號。
+    if (error?.stage === "rate_limited" && error?.details?.accountCooldown === true) {
       unusualActivityUntil = Date.now() + (error?.details?.retryAfterMs ?? UNUSUAL_ACTIVITY_COOLDOWN_MS);
     }
     const details = error?.details ?? {};
@@ -1722,7 +1772,7 @@ export const sendConversation = async ({
       error instanceof ChatGPTDesktopError &&
       error.retrySafe === true &&
       details.quotaRejected === true &&
-      details.errorCode === "model_cap_exceeded" &&
+      ["model_cap_exceeded", "usage_limit"].includes(details.errorCode) &&
       details.requestedModel === selectedModel;
 
     if (!canFallback) {

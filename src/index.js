@@ -22,6 +22,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
   const providerId = "chatgpt-desktop";
   let desktopUnavailableUntil = 0;
   let desktopFailures = 0;
+  const modelUnavailableUntil = new Map();
+  const modelFailures = new Map();
   const appPath = pluginOptions?.appPath ?? "/Applications/ChatGPT.app";
   const stateFile =
     pluginOptions?.stateFile ??
@@ -46,7 +48,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
       case "context_length_exceeded":
         return "ChatGPT Desktop 訊息長度超過單次上下文上限（context_length_exceeded: prompt is too long）。";
       case "quota_exceeded": {
-        const resetIso = new Date(Date.now() + 15 * 60 * 1000)
+        const resetMs = Date.parse(error?.details?.resetsAt ?? "");
+        const resetIso = new Date(
+          Number.isFinite(resetMs) ? resetMs : Date.now() + 15 * 60 * 1000,
+        )
           .toISOString()
           .slice(0, 19)
           .replace("T", " ");
@@ -580,7 +585,11 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 response.headers.set("X-ChatGPT-Account-Source", "company");
                 return response;
               };
-              if (companyFallback && Date.now() < desktopUnavailableUntil) return await sendToCompany();
+              const requestedModel = typeof payload.model === "string" ? payload.model.trim() : "";
+              const modelCooldownUntil = modelUnavailableUntil.get(requestedModel) ?? 0;
+              if (companyFallback && (Date.now() < desktopUnavailableUntil || Date.now() < modelCooldownUntil)) {
+                return await sendToCompany();
+              }
               const instantFallback = !companyFallback && Boolean(
                 input?.magpie?.option?.(providerId, "instant_fallback"),
               );
@@ -640,21 +649,41 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   );
                 },
               }).catch(async (error) => {
-                const accountUnavailable = error instanceof ChatGPTDesktopError
+                const canSwitchAccount = companyFallback
+                  && error instanceof ChatGPTDesktopError
                   && !["unsupported_input", "context_length_exceeded"].includes(error.stage)
                   && (error.status === 429 || error.status >= 500);
-                if (companyFallback && accountUnavailable) {
-                  desktopFailures += 1;
-                  const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
-                  desktopUnavailableUntil = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
+                if (canSwitchAccount) {
+                  if (error.stage === "quota_exceeded") {
+                    const count = (modelFailures.get(requestedModel) ?? 0) + 1;
+                    if (requestedModel) modelFailures.set(requestedModel, count);
+                    const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(count - 1, 4));
+                    const until = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
+                    if (requestedModel) {
+                      modelUnavailableUntil.set(requestedModel, Math.max(modelUnavailableUntil.get(requestedModel) ?? 0, until));
+                    }
+                    for (const [slug, resetIso] of Object.entries(error?.details?.limitedModels ?? {})) {
+                      const parsed = Date.parse(String(resetIso));
+                      if (Number.isFinite(parsed) && parsed > Date.now()) {
+                        modelUnavailableUntil.set(slug, Math.max(modelUnavailableUntil.get(slug) ?? 0, parsed));
+                      }
+                    }
+                  } else if (error.stage === "rate_limited" && error?.details?.accountCooldown === true) {
+                    desktopFailures += 1;
+                    const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
+                    desktopUnavailableUntil = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
+                  }
                 }
-                const canSwitchAccount = companyFallback && accountUnavailable;
                 if (!canSwitchAccount || init?.signal?.aborted) throw error;
                 return sendToCompany();
               });
               if (result instanceof Response) return result;
               desktopFailures = 0;
               desktopUnavailableUntil = 0;
+              if (requestedModel) {
+                modelFailures.delete(requestedModel);
+                modelUnavailableUntil.delete(requestedModel);
+              }
 
               const completionId = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);
@@ -828,7 +857,9 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     status: 429,
                     headers: {
                       "content-type": "application/json",
-                      "Retry-After": "60",
+                      "Retry-After": String(
+                        Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 60000) / 1000)),
+                      ),
                     },
                   },
                 );

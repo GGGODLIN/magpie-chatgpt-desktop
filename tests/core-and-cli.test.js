@@ -218,6 +218,12 @@ const startMockCdpServer = async (scenario = {}) => {
             `      if (scenario.stalledConversation) {`,
             `        return { update_time: Date.now() / 1000 - 120, mapping: { a: { message: { author: { role: "assistant" }, status: "in_progress", channel: "final", recipient: "all", content: { content_type: "text", parts: ["half"] } } } } };`,
             `      }`,
+            `      if (scenario.finalOnSecondRead) {`,
+            `        const readCalls = globalThis.__testReads.filter((p) => p === path).length;`,
+            `        if (readCalls < 2) {`,
+            `          return { mapping: { thought: { message: { author: { role: "assistant" }, status: "finished_successfully", content: { content_type: "thoughts", parts: ["done thinking"] } } } } };`,
+            `        }`,
+            `      }`,
             `      if (scenario.kind === "accepted-quota" || scenario.emptyConversation) {`,
             `        return { mapping: {} };`,
             `      }`,
@@ -268,6 +274,15 @@ const startMockCdpServer = async (scenario = {}) => {
             `      if (path === "/conversation/init" && scenario.sendBlockedUntil) {`,
             `        return { blocked_features: [{ name: "send", resets_after: scenario.sendBlockedUntil }] };`,
             `      }`,
+            `      if (path === "/conversation/init" && scenario.reasonBlockedUntil) {`,
+            `        return {`,
+            `          blocked_features: [{ name: "reason", resets_after: scenario.reasonBlockedUntil }],`,
+            `          model_limits: [`,
+            `            { model_slug: "gpt-5-6-thinking", resets_after: scenario.reasonBlockedUntil },`,
+            `            { model_slug: "gpt-6-thinking", resets_after: scenario.reasonBlockedUntil },`,
+            `          ],`,
+            `        };`,
+            `      }`,
             `      return {};`,
             `    },`,
             `    streamPost: (_path, init) => {`,
@@ -293,7 +308,33 @@ const startMockCdpServer = async (scenario = {}) => {
             `        init.onComplete({ conversation_id: "conv-stream-456" });`,
             `      } else if (scenario.kind === "success" || (body.model.endsWith("-instant") && !scenario.instantQuota)) {`,
             `        init.onComplete({ conversation_id: "conv-123" });`,
-            `      } else if (scenario.kind === "unusual") {`,
+            `      } else if (scenario.kind === "usage-limit") {
+        init.onEvent({ type: "fetch-stream-event", data: { conversation_id: "conv-usage-limit" } });
+        init.onError({
+          type: "fetch-stream-error",
+          error: JSON.stringify({ error: "你已達到上限。請稍後再試一次。", error_code: "usage_limit" }),
+          responseStatus: 200,
+          errorCode: "usage_limit",
+          failureOrigin: "server_stream",
+        });
+      } else if (scenario.kind === "stream-final-then-error") {
+        init.onEvent({
+          type: "fetch-stream-event",
+          data: {
+            conversation_id: "conv-final-err",
+            message: {
+              author: { role: "assistant" },
+              status: "finished_successfully",
+              channel: "final",
+              recipient: "all",
+              content: { content_type: "text", parts: [answer] },
+              create_time: 500,
+              metadata: { model_slug: body.model },
+            },
+          },
+        });
+        init.onError({ type: "fetch-stream-error", responseStatus: 200, failureOrigin: "server_stream" });
+      } else if (scenario.kind === "unusual") {`,
             `        init.onEvent({ type: "fetch-stream-event", data: { conversation_id: "conv-unusual" } });`,
             `        init.onError({ type: "fetch-stream-error", error: JSON.stringify({ error: "Our systems have detected unusual activity coming from your system. Please try again later." }), responseStatus: 200, failureOrigin: "server_stream" });`,
             `      } else if (scenario.kind === "rejected") {`,
@@ -845,7 +886,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
     }
   });
 
-  test("串流狀態已結束但回答停在 in_progress 時，最多讀兩次就放棄", async () => {
+  test("串流狀態已結束但回答停在 in_progress 時，最多讀兩次就放棄，且不啟動程序冷卻", async () => {
     const mock = await startMockCdpServer({ kind: "unusual", stalledConversation: true });
     try {
       globalThis.__magpieStatusGapMs = 50;
@@ -857,6 +898,7 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       }
       expect(err?.status).toBe(429);
       expect(err?.details?.recoverReads).toBe(2);
+      expect(err?.details?.accountCooldown).toBe(false);
       expect(globalThis.__magpieUnusualActivityUntil ?? 0).toBeLessThan(Date.now() + 2000);
     } finally {
       delete globalThis.__magpieStatusGapMs;
@@ -864,6 +906,64 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       globalThis.__magpieUnusualActivityUntil = 0;
       resetUnusualActivityCooldown();
       mock.stop();
+    }
+  });
+
+  test("串流已帶完稿答案才發生尾端錯誤時直接採用答案，轉 COMPLETE 後第 2 次讀取才落盤也能救回，且 usage_limit 不進撈答案迴圈", async () => {
+    const finalErrMock = await startMockCdpServer({
+      kind: "stream-final-then-error",
+      answer: "already complete in stream",
+    });
+    try {
+      const chat = await sendConversation({ cdpUrl: finalErrMock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      expect(chat.answer).toBe("already complete in stream");
+      expect(finalErrMock.state.reads.filter((r) => r.startsWith("/conversation/"))).toEqual([]);
+    } finally {
+      finalErrMock.stop();
+    }
+
+    const secondReadMock = await startMockCdpServer({
+      kind: "unusual",
+      answer: "persisted on second read",
+      finalOnSecondRead: true,
+    });
+    try {
+      globalThis.__magpieStatusGapMs = 20;
+      const chat = await sendConversation({ cdpUrl: secondReadMock.cdpUrl, prompt: "hi", model: "gpt-6-thinking" });
+      expect(chat.answer).toBe("persisted on second read");
+      expect(chat.recoverReads).toBe(2);
+    } finally {
+      delete globalThis.__magpieStatusGapMs;
+      globalThis.__magpieSoftFlagAt = 0;
+      resetUnusualActivityCooldown();
+      secondReadMock.stop();
+    }
+
+    const resetsAt = new Date(Date.now() + 36 * 60 * 60 * 1000).toISOString();
+    const usageMock = await startMockCdpServer({
+      kind: "usage-limit",
+      reasonBlockedUntil: resetsAt,
+    });
+    try {
+      let err = null;
+      try {
+        await sendConversation({ cdpUrl: usageMock.cdpUrl, prompt: "hi", model: "gpt-5-6-thinking" });
+      } catch (error) {
+        err = error;
+      }
+      expect(err?.stage).toBe("quota_exceeded");
+      expect(err?.details?.errorCode).toBe("usage_limit");
+      expect(err?.details?.resetsAt).toBe(resetsAt);
+      expect(err?.details?.limitedModels).toEqual({
+        "gpt-5-6-thinking": resetsAt,
+        "gpt-6-thinking": resetsAt,
+      });
+      // 不應進入 stream_status 或 GET /conversation/{id} 撈答案
+      expect(usageMock.state.reads.filter((r) => r.startsWith("/conversation/"))).toEqual([]);
+      expect(usageMock.state.reads).toContain("POST /conversation/init");
+    } finally {
+      resetUnusualActivityCooldown();
+      usageMock.stop();
     }
   });
 

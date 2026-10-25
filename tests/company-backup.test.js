@@ -77,7 +77,15 @@ const ask = (loader, model = "gpt-6-thinking", effort = "high", stream = false) 
 
 describe("same-model company account backup", () => {
   test("keeps each requested model, effort and prompt; company backup takes precedence over Instant downgrade", async () => {
-    const { state, loader } = await fixture();
+    const resetsAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const { state, loader } = await fixture({
+      desktop: {
+        stage: "quota_exceeded",
+        quotaRejected: true,
+        resetsAt,
+        limitedModels: { "gpt-6-thinking": resetsAt, "gpt-5-6-thinking": resetsAt },
+      },
+    });
     for (const [model, effort, expected] of [["gpt-6-thinking", "high", "extended"], ["gpt-5-6-thinking", "low", "min"]]) {
       resetUnusualActivityCooldown();
       const response = await ask(loader, model, effort);
@@ -144,7 +152,7 @@ describe("same-model company account backup", () => {
 
   test("switches the same request once after an incomplete conversation or unknown Desktop state", async () => {
     for (const desktop of [
-      { stage: "rate_limited", conversationId: "already-sent", assistantSeen: true, retryAfterMs: 30000 },
+      { stage: "rate_limited", accountCooldown: false, conversationId: "already-sent", assistantSeen: true, retryAfterMs: 30000 },
       { stage: "unknown_send_state", retrySafe: false },
       { stage: "cdp_unreachable", quotaRejected: false },
     ]) {
@@ -157,6 +165,38 @@ describe("same-model company account backup", () => {
       expect(state.sent).toHaveLength(1);
       expect(state.sent[0].thinking_effort).toBe("extended");
     }
+  });
+
+  test("does not freeze the personal Desktop account after a single-request stall or disconnect", async () => {
+    const { state, loader } = await fixture({
+      desktop: { stage: "rate_limited", accountCooldown: false, conversationId: "stalled-once", assistantSeen: true, retryAfterMs: 30000 },
+    });
+    expect((await ask(loader, "gpt-5-6-thinking", "high")).status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    expect((await ask(loader, "gpt-5-6-thinking", "high")).status).toBe(200);
+    expect(state.desktopCalls).toBe(2);
+    expect(state.sent).toHaveLength(2);
+  });
+
+  test("cools down only the quota-limited models so unlocked Instant models still try Desktop first", async () => {
+    const resetsAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const { state, loader } = await fixture({
+      models: ["gpt-6-thinking", "gpt-5-6-thinking", "gpt-6-instant"],
+      desktop: {
+        stage: "quota_exceeded",
+        quotaRejected: true,
+        resetsAt,
+        limitedModels: { "gpt-6-thinking": resetsAt, "gpt-5-6-thinking": resetsAt },
+      },
+    });
+    expect((await ask(loader, "gpt-6-thinking", "high")).status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    // 同一波被鎖的 gpt-5-6-thinking 直接走公司帳號，不重打 Desktop
+    expect((await ask(loader, "gpt-5-6-thinking", "low")).status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    // 未被鎖的 gpt-6-instant 仍會先走個人 Desktop
+    expect((await ask(loader, "gpt-6-instant", "low")).status).toBe(200);
+    expect(state.desktopCalls).toBe(2);
   });
 
   test("does not send to either account when cancelled", async () => {
@@ -186,8 +226,8 @@ describe("same-model company account backup", () => {
     expect(state.companyCalls).toBe(0);
   });
 
-  test("backs up the current request and keeps subsequent requests on the company during Desktop cooldown", async () => {
-    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+  test("backs up the current request and keeps subsequent requests on the company during Desktop account cooldown", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", accountCooldown: true, retryAfterMs: 30000 } });
     const first = await ask(loader, "gpt-5-6-thinking", "high");
     expect(first.status).toBe(200);
     expect(state.sent).toHaveLength(1);
@@ -200,7 +240,7 @@ describe("same-model company account backup", () => {
   });
 
   test("keeps a request spaced one minute later on the company backup", async () => {
-    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", accountCooldown: true, retryAfterMs: 30000 } });
     expect((await ask(loader)).status).toBe(200);
     const now = Date.now;
     const started = now();
@@ -215,7 +255,7 @@ describe("same-model company account backup", () => {
   });
 
   test("backs up recovery attempts too and extends the wait after repeated Desktop failures", async () => {
-    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", accountCooldown: true, retryAfterMs: 30000 } });
     expect((await ask(loader)).status).toBe(200);
     const now = Date.now;
     const started = now();
@@ -236,7 +276,7 @@ describe("same-model company account backup", () => {
   });
 
   test("does not shorten an explicit longer Desktop cooldown", async () => {
-    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 7 * 60 * 60 * 1000 } });
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", accountCooldown: true, retryAfterMs: 7 * 60 * 60 * 1000 } });
     expect((await ask(loader)).status).toBe(200);
     const now = Date.now;
     const started = now();
