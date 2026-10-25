@@ -393,7 +393,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
         {
           key: "company_fallback",
           label: "Same-model company account backup",
-          description: "桌面帳號在送出前被限流時，使用已設定的公司網頁帳號，保留原模型與思考強度；不支援該模型就回報錯誤。",
+          description: "桌面帳號限流、連線失敗或未取得完整答案時，同一筆改用公司帳號，保留原模型與思考強度；兩邊可能都消耗額度。",
           confirm: "備援請求會送入公司工作區。暫存對話不進聊天歷史，但不代表零留存。",
           default: false,
         },
@@ -640,16 +640,15 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   );
                 },
               }).catch(async (error) => {
-                if (companyFallback && ["rate_limited", "quota_exceeded"].includes(error?.stage)) {
+                const accountUnavailable = error instanceof ChatGPTDesktopError
+                  && !["unsupported_input", "context_length_exceeded"].includes(error.stage)
+                  && (error.status === 429 || error.status >= 500);
+                if (companyFallback && accountUnavailable) {
                   desktopFailures += 1;
                   const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
                   desktopUnavailableUntil = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
                 }
-                const canSwitchAccount = companyFallback
-                  && error?.retrySafe === true
-                  && !error?.details?.conversationId
-                  && !error?.details?.assistantSeen
-                  && ["rate_limited", "quota_exceeded"].includes(error?.stage);
+                const canSwitchAccount = companyFallback && accountUnavailable;
                 if (!canSwitchAccount || init?.signal?.aborted) throw error;
                 return sendToCompany();
               });

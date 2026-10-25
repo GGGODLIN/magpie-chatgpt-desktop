@@ -142,55 +142,94 @@ describe("same-model company account backup", () => {
     expect(state.sent).toHaveLength(0);
   });
 
-  test("does not switch accounts after a conversation was created, on unknown state, or invalid input", async () => {
+  test("switches the same request once after an incomplete conversation or unknown Desktop state", async () => {
     for (const desktop of [
-      { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 },
+      { stage: "rate_limited", conversationId: "already-sent", assistantSeen: true, retryAfterMs: 30000 },
       { stage: "unknown_send_state", retrySafe: false },
-      { stage: "unsupported_input" },
+      { stage: "cdp_unreachable", quotaRejected: false },
     ]) {
       resetUnusualActivityCooldown();
       const { state, loader } = await fixture({ desktop });
-      const response = await ask(loader);
-      expect(response.status).not.toBe(200);
-      if (desktop.stage === "rate_limited") {
-        expect((await response.json()).error.message).toContain("conversation=true");
-      }
-      expect(state.companyCalls).toBe(0);
+      const response = await ask(loader, "gpt-5-6-thinking", "high");
+      expect(response.status).toBe(200);
+      expect((await response.json()).model).toBe("gpt-5-6-thinking");
+      expect(state.desktopCalls).toBe(1);
+      expect(state.sent).toHaveLength(1);
+      expect(state.sent[0].thinking_effort).toBe("extended");
     }
   });
 
-  test("sends the next new request to the company during Desktop cooldown without duplicating the failed request", async () => {
+  test("does not send to either account when cancelled", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "unknown_send_state", retrySafe: false } });
+    const controller = new AbortController();
+    controller.abort();
+    await loader.fetch("http://fixture/v1/chat/completions", {
+      signal: controller.signal,
+      body: JSON.stringify({ model: "gpt-6-thinking", messages: [{ role: "user", content: "cancelled" }] }),
+    });
+    expect(state.sent).toHaveLength(0);
+  });
+
+  test("reports both-account failure without resending the company request", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 }, conversationStatus: 404 });
+    const response = await ask(loader);
+    expect(response.status).toBe(502);
+    expect((await response.json()).error.code).toBe("unknown_send_state");
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(1);
+  });
+
+  test("does not switch accounts for invalid input", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "unsupported_input", quotaRejected: false } });
+    const response = await ask(loader);
+    expect(response.status).not.toBe(200);
+    expect(state.companyCalls).toBe(0);
+  });
+
+  test("backs up the current request and keeps subsequent requests on the company during Desktop cooldown", async () => {
     const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
     const first = await ask(loader, "gpt-5-6-thinking", "high");
-    expect(first.status).toBe(429);
-    expect(state.sent).toHaveLength(0);
+    expect(first.status).toBe(200);
+    expect(state.sent).toHaveLength(1);
     const next = await ask(loader, "gpt-6-thinking", "low");
     expect(next.status).toBe(200);
     expect(state.desktopCalls).toBe(1);
-    expect(state.sent).toHaveLength(1);
-    expect(state.sent[0].model).toBe("gpt-6-thinking");
-    expect(state.sent[0].thinking_effort).toBe("min");
+    expect(state.sent).toHaveLength(2);
+    expect(state.sent[1].model).toBe("gpt-6-thinking");
+    expect(state.sent[1].thinking_effort).toBe("min");
   });
 
-  test("keeps spaced requests on the backup and backs off repeated Desktop failures", async () => {
+  test("keeps a request spaced one minute later on the company backup", async () => {
     const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
-    expect((await ask(loader)).status).toBe(429);
+    expect((await ask(loader)).status).toBe(200);
     const now = Date.now;
     const started = now();
     try {
       Date.now = () => started + 61000;
       expect((await ask(loader)).status).toBe(200);
       expect(state.desktopCalls).toBe(1);
+      expect(state.sent).toHaveLength(2);
+    } finally {
+      Date.now = now;
+    }
+  });
+
+  test("backs up recovery attempts too and extends the wait after repeated Desktop failures", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+    expect((await ask(loader)).status).toBe(200);
+    const now = Date.now;
+    const started = now();
+    try {
       Date.now = () => started + 301000;
-      expect((await ask(loader)).status).toBe(429);
+      expect((await ask(loader)).status).toBe(200);
       expect(state.desktopCalls).toBe(2);
       Date.now = () => started + 602000;
       expect((await ask(loader)).status).toBe(200);
       expect(state.desktopCalls).toBe(2);
       Date.now = () => started + 902000;
-      expect((await ask(loader)).status).toBe(429);
+      expect((await ask(loader)).status).toBe(200);
       expect(state.desktopCalls).toBe(3);
-      expect(state.sent).toHaveLength(2);
+      expect(state.sent).toHaveLength(4);
     } finally {
       Date.now = now;
     }
@@ -198,7 +237,7 @@ describe("same-model company account backup", () => {
 
   test("does not shorten an explicit longer Desktop cooldown", async () => {
     const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 7 * 60 * 60 * 1000 } });
-    expect((await ask(loader)).status).toBe(429);
+    expect((await ask(loader)).status).toBe(200);
     const now = Date.now;
     const started = now();
     try {

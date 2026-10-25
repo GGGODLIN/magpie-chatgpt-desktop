@@ -36,8 +36,8 @@ When you click **Sign in** on the **ChatGPT Desktop** provider in Magpie:
 
 - **`company_fallback` (Same-model company account backup):**
   - **Default:** `false`. Enable only after approving that request contents may enter the configured company workspace.
-  - On a retry-safe Desktop quota/rate-limit error with no conversation or assistant activity, sends the original request through the dedicated company web account. The requested model, reasoning effort, and JSON/SSE response format are preserved. This option takes precedence over `instant_fallback`.
-  - After a Desktop quota/rate-limit failure, new requests use the company account while Desktop recovery waits 5, 10, 20, 40, then at most 60 minutes between repeated failures. A longer reported cooldown takes precedence; these local retry intervals are not official reset times. A successful Desktop response resets the backoff. A request that already created a Desktop conversation is not resent to the company account; it still fails, while the next new request can use the backup.
+  - If Desktop is rate limited, unavailable, or fails to return a complete answer, sends the same request once through the dedicated company web account, even if Desktop already created a conversation. Both accounts may consume allowance. The requested model, reasoning effort, and JSON/SSE response format are preserved. Invalid input and cancelled requests do not trigger an account switch. This option takes precedence over `instant_fallback`.
+  - After a Desktop quota/rate-limit failure, new requests use the company account while Desktop recovery waits 5, 10, 20, 40, then at most 60 minutes between repeated failures. A longer reported cooldown takes precedence; these local retry intervals are not official reset times. A successful Desktop response resets the backoff. The request that encounters the Desktop failure also uses the company backup; the user does not need to submit it again.
   - Requires the existing dedicated Chrome Beta profile and local company account configuration. The company model catalog is checked before sending; a missing model is an error, never an implicit downgrade. A reported response model that differs from the requested model is also an error and must not be retried.
   - Company requests force temporary-chat flags. Temporary chat does not mean zero retention; account and workspace policies still apply.
 
@@ -51,7 +51,7 @@ When you click **Sign in** on the **ChatGPT Desktop** provider in Magpie:
 
 - **Text-only (`tool_call: false`):** All models declare `tool_call: false` and text-only input/output. Requests with images, audio, files, or tool roles are rejected with HTTP `400` before any CDP call.
 - **Serial concurrency (`maxConcurrency: 1`):** Requests are processed one at a time per account.
-- **No automatic retry on unknown send state:** Once a conversation stream has started, any timeout, disconnect, or missing finished assistant message returns HTTP `502` with `X-Should-Retry: false` (or CLI exit code `3`) and is never automatically resent.
+- **Unknown send state:** With company backup disabled, an ambiguous Desktop submission is not resent. With company backup enabled, the original request may be sent once to the company account. An ambiguous company submission returns HTTP `502` with `X-Should-Retry: false`, preventing further retries.
 
 ## License
 
