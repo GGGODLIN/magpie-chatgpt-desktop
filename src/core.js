@@ -378,7 +378,10 @@ export const buildResolverJs = (
     // 403「Unusual activity has been detected from your device」拒收；改成每筆新拿後 17 筆 0 拒收。
     const attestationProbe = (candidate) =>
       candidate.safeGet("/ios/attestation_challenge", {
-        additionalHeaders: { "X-OpenAI-Attach-DeviceCheck-Token": "1" },
+        additionalHeaders: {
+          "X-OpenAI-Attach-Desktop-Surface": "1",
+          "X-OpenAI-Attach-DeviceCheck-Token": "1",
+        },
       });
     let moduleUrl = primaryUrl;
     let resolved = await resolveChatGPTClient(await import(moduleUrl), attestationProbe);
@@ -614,7 +617,7 @@ ${buildResolverJs(preferredExports)}
       try {
         sendAttempted = true;
         client.streamPost("/f/conversation", {
-          additionalHeaders: {},
+          additionalHeaders: { "X-OpenAI-Attach-Desktop-Surface": "1" },
           body: JSON.stringify(body),
           chatgptSse: {},
           onResponse: remember,
