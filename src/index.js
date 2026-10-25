@@ -758,6 +758,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                       message,
                       type: "rate_limit_error",
                       code: "rate_limit_exceeded",
+                      outcome: error?.details?.outcome ?? null,
+                      conversation_created: Boolean(error?.details?.conversationId),
+                      company_backup_enabled: Boolean(input?.magpie?.option?.(providerId, "company_fallback")),
+                      reason: error?.message ?? null,
                     },
                   }),
                   {
