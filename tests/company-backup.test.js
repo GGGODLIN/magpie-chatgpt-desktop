@@ -172,15 +172,39 @@ describe("same-model company account backup", () => {
     expect(state.sent[0].thinking_effort).toBe("min");
   });
 
-  test("tries Desktop again when its reported cooldown expires", async () => {
+  test("keeps spaced requests on the backup and backs off repeated Desktop failures", async () => {
     const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
     expect((await ask(loader)).status).toBe(429);
     const now = Date.now;
+    const started = now();
     try {
-      Date.now = () => now() + 31000;
+      Date.now = () => started + 61000;
+      expect((await ask(loader)).status).toBe(200);
+      expect(state.desktopCalls).toBe(1);
+      Date.now = () => started + 301000;
       expect((await ask(loader)).status).toBe(429);
       expect(state.desktopCalls).toBe(2);
-      expect(state.sent).toHaveLength(0);
+      Date.now = () => started + 602000;
+      expect((await ask(loader)).status).toBe(200);
+      expect(state.desktopCalls).toBe(2);
+      Date.now = () => started + 902000;
+      expect((await ask(loader)).status).toBe(429);
+      expect(state.desktopCalls).toBe(3);
+      expect(state.sent).toHaveLength(2);
+    } finally {
+      Date.now = now;
+    }
+  });
+
+  test("does not shorten an explicit longer Desktop cooldown", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 7 * 60 * 60 * 1000 } });
+    expect((await ask(loader)).status).toBe(429);
+    const now = Date.now;
+    const started = now();
+    try {
+      Date.now = () => started + 6 * 60 * 60 * 1000;
+      expect((await ask(loader)).status).toBe(200);
+      expect(state.desktopCalls).toBe(1);
     } finally {
       Date.now = now;
     }

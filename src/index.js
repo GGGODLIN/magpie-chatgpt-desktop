@@ -21,6 +21,7 @@ import {
 export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
   const providerId = "chatgpt-desktop";
   let desktopUnavailableUntil = 0;
+  let desktopFailures = 0;
   const appPath = pluginOptions?.appPath ?? "/Applications/ChatGPT.app";
   const stateFile =
     pluginOptions?.stateFile ??
@@ -640,7 +641,9 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 },
               }).catch(async (error) => {
                 if (companyFallback && ["rate_limited", "quota_exceeded"].includes(error?.stage)) {
-                  desktopUnavailableUntil = Date.now() + (error?.details?.retryAfterMs ?? 60000);
+                  desktopFailures += 1;
+                  const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
+                  desktopUnavailableUntil = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
                 }
                 const canSwitchAccount = companyFallback
                   && error?.retrySafe === true
@@ -651,6 +654,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 return sendToCompany();
               });
               if (result instanceof Response) return result;
+              desktopFailures = 0;
+              desktopUnavailableUntil = 0;
 
               const completionId = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);
