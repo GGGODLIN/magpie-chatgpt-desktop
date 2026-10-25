@@ -37,6 +37,7 @@ When you click **Sign in** on the **ChatGPT Desktop** provider in Magpie:
 - **`company_fallback` (Same-model company account backup):**
   - **Default:** `false`. Enable only after approving that request contents may enter the configured company workspace.
   - On a retry-safe Desktop quota/rate-limit error with no conversation or assistant activity, sends the original request through the dedicated company web account. The requested model, reasoning effort, and JSON/SSE response format are preserved. This option takes precedence over `instant_fallback`.
+  - After a Desktop quota/rate-limit failure, new requests use the company account for the reported cooldown. A request that already created a Desktop conversation is not resent to the company account; it still fails, while the next new request can use the backup.
   - Requires the existing dedicated Chrome Beta profile and local company account configuration. The company model catalog is checked before sending; a missing model is an error, never an implicit downgrade. A reported response model that differs from the requested model is also an error and must not be retried.
   - Company requests force temporary-chat flags. Temporary chat does not mean zero retention; account and workspace policies still apply.
 

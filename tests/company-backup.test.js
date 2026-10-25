@@ -92,7 +92,7 @@ describe("same-model company account backup", () => {
       expect(state.sent.at(-1).history_and_training_disabled).toBe(true);
       expect(state.sent.at(-1).is_do_not_remember).toBe(true);
     }
-    expect(state.desktopCalls).toBe(2);
+    expect(state.desktopCalls).toBe(1);
     expect(state.sent).toHaveLength(2);
     expect(state.closes).toBe(2);
   });
@@ -150,8 +150,39 @@ describe("same-model company account backup", () => {
     ]) {
       resetUnusualActivityCooldown();
       const { state, loader } = await fixture({ desktop });
-      expect((await ask(loader)).status).not.toBe(200);
+      const response = await ask(loader);
+      expect(response.status).not.toBe(200);
+      if (desktop.stage === "rate_limited") {
+        expect((await response.json()).error.message).toContain("conversation=true");
+      }
       expect(state.companyCalls).toBe(0);
+    }
+  });
+
+  test("sends the next new request to the company during Desktop cooldown without duplicating the failed request", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+    const first = await ask(loader, "gpt-5-6-thinking", "high");
+    expect(first.status).toBe(429);
+    expect(state.sent).toHaveLength(0);
+    const next = await ask(loader, "gpt-6-thinking", "low");
+    expect(next.status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(1);
+    expect(state.sent[0].model).toBe("gpt-6-thinking");
+    expect(state.sent[0].thinking_effort).toBe("min");
+  });
+
+  test("tries Desktop again when its reported cooldown expires", async () => {
+    const { state, loader } = await fixture({ desktop: { stage: "rate_limited", conversationId: "already-sent", retryAfterMs: 30000 } });
+    expect((await ask(loader)).status).toBe(429);
+    const now = Date.now;
+    try {
+      Date.now = () => now() + 31000;
+      expect((await ask(loader)).status).toBe(429);
+      expect(state.desktopCalls).toBe(2);
+      expect(state.sent).toHaveLength(0);
+    } finally {
+      Date.now = now;
     }
   });
 

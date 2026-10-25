@@ -20,6 +20,7 @@ import {
 
 export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
   const providerId = "chatgpt-desktop";
+  let desktopUnavailableUntil = 0;
   const appPath = pluginOptions?.appPath ?? "/Applications/ChatGPT.app";
   const stateFile =
     pluginOptions?.stateFile ??
@@ -570,6 +571,15 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 typeof getAuth === "function" ? await getAuth() : null;
               const cdpUrl = await resolveActiveCdpUrl(auth);
               const companyFallback = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
+              const sendToCompany = async () => {
+                if (init?.signal?.aborted) throw init.signal.reason ?? new Error("Request aborted");
+                const company = await chatgptWebBizPlugin(input, pluginOptions?.companyBackup ?? {});
+                const loader = await company.auth.loader();
+                const response = await loader.fetch(_requestUrl, { ...init, body: JSON.stringify(payload) });
+                response.headers.set("X-ChatGPT-Account-Source", "company");
+                return response;
+              };
+              if (companyFallback && Date.now() < desktopUnavailableUntil) return await sendToCompany();
               const instantFallback = !companyFallback && Boolean(
                 input?.magpie?.option?.(providerId, "instant_fallback"),
               );
@@ -629,17 +639,16 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   );
                 },
               }).catch(async (error) => {
+                if (companyFallback && ["rate_limited", "quota_exceeded"].includes(error?.stage)) {
+                  desktopUnavailableUntil = Date.now() + (error?.details?.retryAfterMs ?? 60000);
+                }
                 const canSwitchAccount = companyFallback
                   && error?.retrySafe === true
                   && !error?.details?.conversationId
                   && !error?.details?.assistantSeen
                   && ["rate_limited", "quota_exceeded"].includes(error?.stage);
                 if (!canSwitchAccount || init?.signal?.aborted) throw error;
-                const company = await chatgptWebBizPlugin(input, pluginOptions?.companyBackup ?? {});
-                const loader = await company.auth.loader();
-                const response = await loader.fetch(_requestUrl, { ...init, body: JSON.stringify(payload) });
-                response.headers.set("X-ChatGPT-Account-Source", "company");
-                return response;
+                return sendToCompany();
               });
               if (result instanceof Response) return result;
 
@@ -712,7 +721,10 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                 },
               );
             } catch (error) {
-              const message = formatDiagnostic(error);
+              const companyBackupEnabled = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
+              const message = formatDiagnostic(error) + (companyBackupEnabled && error?.stage === "rate_limited"
+                ? ` [backup: outcome=${error?.details?.outcome ?? "unknown"}, conversation=${Boolean(error?.details?.conversationId)}; ${error?.message ?? ""}]`
+                : "");
               if (
                 error?.stage === "context_length_exceeded" ||
                 error?.status === 413
