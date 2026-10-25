@@ -1,6 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { chatgptWebBizPlugin } from "./web.js";
 import {
   ChatGPTDesktopError,
   DEFAULT_CDP_PORT,
@@ -387,6 +388,13 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
             "當 Pro 或 Thinking 模型遇到 model_cap_exceeded 配額拒絕且無對話活動時，自動改送同版本非工作模式 Instant 模型一次（預設關閉，不靜默降級）。",
           default: false,
         },
+        {
+          key: "company_fallback",
+          label: "Same-model company account backup",
+          description: "桌面帳號在送出前被限流時，使用已設定的公司網頁帳號，保留原模型與思考強度；不支援該模型就回報錯誤。",
+          confirm: "備援請求會送入公司工作區。暫存對話不進聊天歷史，但不代表零留存。",
+          default: false,
+        },
       ],
       methods: [
         {
@@ -561,7 +569,8 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
               const auth =
                 typeof getAuth === "function" ? await getAuth() : null;
               const cdpUrl = await resolveActiveCdpUrl(auth);
-              const instantFallback = Boolean(
+              const companyFallback = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
+              const instantFallback = !companyFallback && Boolean(
                 input?.magpie?.option?.(providerId, "instant_fallback"),
               );
               const effort =
@@ -619,7 +628,20 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     { writeStderr: () => {} },
                   );
                 },
+              }).catch(async (error) => {
+                const canSwitchAccount = companyFallback
+                  && error?.retrySafe === true
+                  && !error?.details?.conversationId
+                  && !error?.details?.assistantSeen
+                  && ["rate_limited", "quota_exceeded"].includes(error?.stage);
+                if (!canSwitchAccount || init?.signal?.aborted) throw error;
+                const company = await chatgptWebBizPlugin(input, pluginOptions?.companyBackup ?? {});
+                const loader = await company.auth.loader();
+                const response = await loader.fetch(_requestUrl, { ...init, body: JSON.stringify(payload) });
+                response.headers.set("X-ChatGPT-Account-Source", "company");
+                return response;
               });
+              if (result instanceof Response) return result;
 
               const completionId = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);

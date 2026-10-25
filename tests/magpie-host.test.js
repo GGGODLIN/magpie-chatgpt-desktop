@@ -424,6 +424,11 @@ describe("Ticket 02 — 真實 Magpie Bun 外掛宿主整合測試", () => {
           key: "instant_fallback",
           default: false,
         }),
+        expect.objectContaining({
+          key: "company_fallback",
+          default: false,
+          confirm: expect.stringContaining("公司工作區"),
+        }),
       ]);
       expect(host.nonJsonStdoutLines).toEqual([]);
       expect(host.rawStdoutLines.length).toBeGreaterThanOrEqual(2);

@@ -135,6 +135,8 @@ export const sendWebConversation = async ({
   const cdp = await openSession(version.webSocketDebuggerUrl);
   const started = Date.now();
   let targetId = null;
+  let sendAttempted = false;
+  let postStatus = null;
   try {
     // 每筆在常駐視窗裡開背景分頁：沒有任何視窗時 Chrome 會為分頁新開視窗、送完關掉，畫面一直閃；
     // 所以先留一個常駐視窗讓使用者自己縮到最小（加了不節流參數，背景分頁與最小化都照常渲染，2026-10-21 實測）。
@@ -156,7 +158,6 @@ export const sendWebConversation = async ({
     };
 
     let conversationId = null;
-    let postStatus = null;
     let rewritten = false;
     cdp.listeners.add(async (message) => {
       if (message.sessionId !== sessionId) return;
@@ -166,6 +167,7 @@ export const sendWebConversation = async ({
         if (/\/backend-api\/f\/conversation$/.test(url) && params.request.postData && !rewritten) {
           rewritten = true;
           const body = rewriteConversationBody(JSON.parse(params.request.postData), { prompt, model, effort });
+          sendAttempted = true;
           await cdp.send("Fetch.continueRequest", { requestId: params.requestId, postData: Buffer.from(JSON.stringify(body)).toString("base64") }, sessionId);
         } else {
           await cdp.send("Fetch.continueRequest", { requestId: params.requestId }, sessionId);
@@ -200,6 +202,15 @@ export const sendWebConversation = async ({
     if (!expectedEmail) throw unavailable("公司網頁版沒設定預期帳號，不送出", "account_mismatch", 10 * 60 * 1000);
     if (!email || email.toLowerCase() !== expectedEmail.toLowerCase()) {
       throw unavailable(`公司網頁版未登入預期帳號（目前：${email ?? "未登入"}）`, "account_mismatch", 10 * 60 * 1000);
+    }
+
+    const catalog = await api("/models?iim=false&include_icons=false&is_gizmo=false");
+    if (catalog.status !== 200) throw unavailable("公司網頁版讀不到模型目錄，未送出", "catalog_unavailable");
+    const availableModels = JSON.parse(catalog.body)?.models ?? [];
+    if (!availableModels.some((entry) => entry.slug === model)) {
+      throw new ChatGPTDesktopError(`公司帳號不支援原模型 ${model}，未送出，也未替換模型`, {
+        stage: "model_not_available", status: 400,
+      });
     }
 
     const focused = await evaluate(`(async () => {
@@ -256,6 +267,11 @@ export const sendWebConversation = async ({
       if (reply.status !== 200) throw rateLimited(`公司網頁版讀不到對話（HTTP ${reply.status}）`, 30000);
       const answer = extractFinalAnswer(JSON.parse(reply.body));
       if (answer?.status === "finished_successfully" && answer.text) {
+        if (answer.model && answer.model !== model) {
+          throw new ChatGPTDesktopError(`公司帳號回覆模型 ${answer.model} 與原模型 ${model} 不符，未採用答案`, {
+            stage: "model_mismatch", retrySafe: false, status: 502,
+          });
+        }
         // 網頁版不回 token 數，跟桌面版一樣用字元估算，讓 Magpie 的用量紀錄量得到公司帳號接了多少。
         const promptTokens = estimateTokenCount(prompt);
         const completionTokens = estimateTokenCount(answer.text);
@@ -267,6 +283,15 @@ export const sendWebConversation = async ({
       await sleep(5000);
     }
     throw rateLimited(`公司網頁版回答停在半截（串流狀態 ${streamStatus}）`, 30000);
+  } catch (error) {
+    // 公司備援也可能已生成；沒有明確拒收時，禁止閘道或呼叫端再補送。
+    if (sendAttempted && !(postStatus >= 400)) {
+      throw new ChatGPTDesktopError(String(error?.message ?? error), {
+        stage: error?.stage === "model_mismatch" ? "model_mismatch" : "unknown_send_state",
+        retrySafe: false, status: 502,
+      });
+    }
+    throw error;
   } finally {
     if (targetId) await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
     cdp.close();
@@ -275,10 +300,10 @@ export const sendWebConversation = async ({
 
 const errorResponse = (error) => {
   const retryAfterMs = error?.details?.retryAfterMs ?? 60000;
-  const status = error?.status === 429 ? 429 : error?.status === 413 ? 413 : error?.status === 400 ? 400 : 503;
+  const status = error?.retrySafe === false ? 502 : error?.status === 429 ? 429 : error?.status === 413 ? 413 : error?.status === 400 ? 400 : 503;
   return new Response(JSON.stringify({ error: { message: String(error?.message ?? error), type: error?.stage ?? "unavailable", code: error?.stage ?? "unavailable" } }), {
     status,
-    headers: { "content-type": "application/json", "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))) },
+    headers: { "content-type": "application/json", "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))), ...(error?.retrySafe === false ? { "X-Should-Retry": "false" } : {}) },
   });
 };
 
@@ -350,6 +375,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
                 effort,
                 timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
                 dailyBudget: pluginOptions?.dailyBudget ?? null,
+                budgetFile: pluginOptions?.budgetFile,
                 signal: init?.signal,
               });
               const id = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
