@@ -401,7 +401,9 @@ export const buildResolverJs = (
     return undefined;
   };
 
-  const attestedClient = async () => {
+  // probe 由呼叫端決定如何驗證候選；不傳時用唯讀 attestation 查詢。偵測器的形狀檢查可傳
+  // 不發請求的 probe（例如 async () => true）。probe 對某候選拋錯只記進 tried、換下一個候選。
+  const attestedClient = async (probe) => {
     const { urls, appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
     if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
     // 每筆都拿新 challenge、不快取：2026-10-20 被標記期間沿用快取 challenge 的請求幾秒內就被
@@ -413,13 +415,16 @@ export const buildResolverJs = (
           "X-OpenAI-Attach-DeviceCheck-Token": "1",
         },
       });
+    const activeProbe = typeof probe === "function" ? probe : attestationProbe;
     let moduleUrl = primaryUrl;
-    let resolved = await resolveChatGPTClient(await import(moduleUrl), attestationProbe);
+    let resolved = await resolveChatGPTClient(await import(moduleUrl), activeProbe);
     if (!resolved.client && appSharedUrl) {
       const fallbackUrl = appInitialUrl ?? await discoverAppInitialUrl(urls, [appSharedUrl]);
       if (fallbackUrl) {
         moduleUrl = fallbackUrl;
-        resolved = await resolveChatGPTClient(await import(fallbackUrl), attestationProbe);
+        const firstTried = resolved.tried;
+        resolved = await resolveChatGPTClient(await import(fallbackUrl), activeProbe);
+        resolved = { ...resolved, tried: [...firstTried, ...resolved.tried] };
       }
     }
     if (!resolved.client) {

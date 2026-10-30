@@ -1814,3 +1814,154 @@ describe("Ticket 01 — CLI 入口 (--probe、退出碼 0/1/3、SIDECAR_WEB_RETR
     }
   });
 });
+
+describe("resolver 片段（--render-expression resolver）", () => {
+  const renderCli = async (args, env = {}) => {
+    let out = "";
+    let err = "";
+    const code = await runCli(args, {
+      env,
+      writeStdout: (s) => {
+        out += s;
+      },
+      writeStderr: (s) => {
+        err += s;
+      },
+    });
+    return { code, out, err };
+  };
+
+  // 呼叫端的做法：片段字串 + 自己的業務 JS，包成 IIFE 後在 renderer 評估。
+  const resolveWith = async (mock, probeSource, scenarioEnv = {}) => {
+    const { code, out } = await renderCli(
+      ["--render-expression", "resolver"],
+      scenarioEnv,
+    );
+    expect(code).toBe(0);
+    const expression = `(async () => {
+${out}
+  const resolved = await attestedClient(${probeSource});
+  return { ...resolved, client: !!resolved.client };
+})()`;
+    return evaluateInRenderer({ wsUrl: mock.wsUrl, expression });
+  };
+
+  test("輸出不包 IIFE 的片段，定義 resolveChatGPTClient 與 attestedClient，並帶入偏好 export 清單", async () => {
+    const { code, out } = await renderCli(
+      ["--render-expression", "resolver"],
+      { CODEX_ADVISOR_CLIENT_EXPORT: "zzFirst,zzSecond" },
+    );
+    expect(code).toBe(0);
+    expect(out).toContain("const resolveChatGPTClient");
+    expect(out).toContain("const attestedClient = async (probe");
+    expect(out).toContain('["zzFirst","zzSecond"]');
+    expect(out.trimStart().startsWith("(async")).toBe(false);
+  });
+
+  test("不傳探測時沿用 attestation 查詢；傳入自訂探測時以該探測判定候選且不再查 attestation", async () => {
+    const defaultMock = await startMockCdpServer({ kind: "success" });
+    try {
+      const resolved = await resolveWith(defaultMock, "");
+      expect(resolved.client).toBe(true);
+      expect(resolved.exportName).toBe("cF");
+      expect(resolved.probeValue.attestation_challenge).toBe(
+        "challenge-token-xyz",
+      );
+      expect(defaultMock.state.reads).toContain("/ios/attestation_challenge");
+    } finally {
+      defaultMock.stop();
+    }
+
+    const customMock = await startMockCdpServer({ kind: "success" });
+    try {
+      const resolved = await resolveWith(
+        customMock,
+        `async (client) => ({ shape: typeof client.safeGet })`,
+      );
+      expect(resolved.client).toBe(true);
+      expect(resolved.probeValue).toEqual({ shape: "function" });
+      expect(customMock.state.reads).toEqual([]);
+    } finally {
+      customMock.stop();
+    }
+  });
+
+  test("傳入不發網路請求的探測時仍解析出 client，mock 端沒收到任何請求", async () => {
+    const mock = await startMockCdpServer({
+      kind: "success",
+      sharedRpcPromiseOnly: true,
+      entryImportLayout: true,
+      initialExportName: "_lr",
+    });
+    try {
+      const resolved = await resolveWith(mock, "async () => true");
+      expect(resolved.client).toBe(true);
+      expect(resolved.exportName).toBe("_lr");
+      expect(resolved.moduleUrl).toContain("/app-initial-");
+      expect(mock.state.reads).toEqual([]);
+      expect(mock.state.requests).toEqual([]);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("probe／models／chat 運算式都內嵌同一份 resolver 片段，且各只定義一次", async () => {
+    const { code: snippetCode, out: snippet } = await renderCli([
+      "--render-expression",
+      "resolver",
+    ]);
+    expect(snippetCode).toBe(0);
+    expect(snippet).toContain("const attestedClient");
+    for (const kind of ["probe", "models", "chat"]) {
+      const { code, out } = await renderCli(
+        kind === "chat"
+          ? [
+              "--render-expression",
+              "chat",
+              JSON.stringify({ prompt: "hi", model: THINKING_MODEL }),
+            ]
+          : ["--render-expression", kind],
+      );
+      expect(code).toBe(0);
+      expect(out).toContain(snippet);
+      expect(out.split("const attestedClient").length - 1).toBe(1);
+      expect(out.split("const resolveChatGPTClient").length - 1).toBe(1);
+    }
+  });
+
+  test("自訂探測對某候選拋錯時，記入 tried 並換下一個候選，不中止整輪", async () => {
+    const mock = await startMockCdpServer({
+      kind: "success",
+      initialExportName: "secondClient",
+    });
+    try {
+      const resolved = await resolveWith(
+        mock,
+        `(() => { let n = 0; return async () => { n += 1; if (n === 1) throw new Error("probe boom"); return "ok"; }; })()`,
+      );
+      expect(resolved.client).toBe(true);
+      expect(resolved.exportName).toBe("secondClient");
+      expect(resolved.probeValue).toBe("ok");
+      expect(resolved.tried).toEqual([{ name: "cF", error: "probe boom" }]);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("不認得的 --render-expression 類型回非 0，錯誤訊息帶外掛版本與支援清單", async () => {
+    const { version } = JSON.parse(
+      fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"),
+    );
+    const { code, out, err } = await renderCli([
+      "--render-expression",
+      "no-such-kind",
+    ]);
+    expect(code).not.toBe(0);
+    expect(out).toBe("");
+    expect(err).toContain("no-such-kind");
+    expect(err).toContain(version);
+    for (const kind of ["probe", "models", "chat", "resolver"]) {
+      expect(err).toContain(kind);
+    }
+  });
+});

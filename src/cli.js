@@ -6,12 +6,27 @@ import {
   buildChatExpression,
   buildModelsExpression,
   buildProbeExpression,
+  buildResolverJs,
   finishFallbackLog,
   preferredClientExports,
   probeClient,
   recordFallbackLog,
   sendConversation,
 } from "./core.js";
+
+const RENDER_EXPRESSION_KINDS = ["probe", "models", "chat", "resolver"];
+
+const pluginVersion = () => {
+  try {
+    const raw = fs.readFileSync(
+      fileURLToPath(new URL("../package.json", import.meta.url)),
+      "utf8",
+    );
+    return String(JSON.parse(raw).version ?? "unknown");
+  } catch {
+    return "unknown";
+  }
+};
 
 const readStreamText = async (stream) => {
   const chunks = [];
@@ -52,6 +67,10 @@ export const runCli = async (
       writeStdout(buildModelsExpression(preferred));
       return 0;
     }
+    if (kind === "resolver") {
+      writeStdout(buildResolverJs(preferred));
+      return 0;
+    }
     if (kind === "chat") {
       let options = {};
       if (argv[2]) {
@@ -65,7 +84,10 @@ export const runCli = async (
       writeStdout(buildChatExpression(options, preferred));
       return 0;
     }
-    writeStderr(`不支援的 expression 類型：${kind ?? ""}\n`);
+    // 呼叫端靠版本號與支援清單判斷「已安裝的外掛太舊、不認得這個類型」。
+    writeStderr(
+      `不支援的 expression 類型：${kind ?? ""}（magpie-chatgpt-desktop ${pluginVersion()}，支援：${RENDER_EXPRESSION_KINDS.join(", ")}）\n`,
+    );
     return 1;
   }
 
