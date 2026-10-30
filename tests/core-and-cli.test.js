@@ -386,9 +386,33 @@ const startMockCdpServer = async (scenario = {}) => {
           encodeURIComponent(initialModuleCode + "\n//") +
           `#/assets/app-initial-${crypto.randomUUID()}.js`;
 
-        const resourceEntries = scenario.noModules
-          ? []
-          : [{ name: sharedUrl }, { name: initialUrl }];
+        const resourceEntries =
+          scenario.noModules || scenario.entryImportLayout
+            ? []
+            : [{ name: sharedUrl }, { name: initialUrl }];
+
+        // ChatGPT.app 26.1027：資源計時清單不列 app-initial，頁面上只看得到入口 script 與 modulepreload。
+        let pageNodes = [];
+        if (scenario.entryImportLayout) {
+          const assets = fs.mkdtempSync(path.join(os.tmpdir(), "mcd-entry-"));
+          const write = (name, source) => {
+            fs.writeFileSync(path.join(assets, name), source);
+            return new URL(`file://${path.join(assets, name)}`).href;
+          };
+          const tag = crypto.randomUUID();
+          const sharedFile = write(`app-shared-${tag}.js`, sharedModuleCode);
+          write(`app-initial-${tag}.js`, initialModuleCode);
+          write(
+            `app-main-${tag}.js`,
+            `import{a as b}from"./app-initial-${tag}.js";export{};`,
+          );
+          write(`rpc-${tag}.js`, "export const rpc = {};");
+          const indexFile = write(
+            `index-${tag}.js`,
+            `await I(()=>import(\`./rpc-${tag}.js\`));await I(()=>import(\`./app-main-${tag}.js\`));`,
+          );
+          pageNodes = [{ src: indexFile }, { href: sharedFile }];
+        }
 
         const prevPerformance = globalThis.performance;
         const prevDocument = globalThis.document;
@@ -400,7 +424,7 @@ const startMockCdpServer = async (scenario = {}) => {
           getEntriesByType: () => resourceEntries,
         };
         globalThis.document = {
-          querySelectorAll: () => [],
+          querySelectorAll: () => pageNodes,
         };
 
         let evalResult;
@@ -661,6 +685,34 @@ describe("Ticket 01 — 模組解析（RpcPromise 排除與 app-initial 退回�
       expect(chat.answer).not.toContain("internal reasoning");
       expect(chat.answer).not.toContain("unfinished draft");
       expect(chat.clientExport).toBe("fallbackInitClient");
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("資源計時清單沒有 app-initial 時，從入口 script 的 import 找到它並採用其中的 client", async () => {
+    const mock = await startMockCdpServer({
+      kind: "success",
+      sharedRpcPromiseOnly: true,
+      entryImportLayout: true,
+      initialExportName: "_lr",
+      answer: "entry import answer",
+    });
+
+    try {
+      const probe = await probeClient({ cdpUrl: mock.cdpUrl, env: {} });
+      expect(probe.ok).toBe(true);
+      expect(probe.challengeOk).toBe(true);
+      expect(probe.clientExport).toBe("_lr");
+      expect(probe.moduleUrl).toContain("/app-initial-");
+
+      const chat = await sendConversation({
+        cdpUrl: mock.cdpUrl,
+        prompt: "Hello",
+        model: THINKING_MODEL,
+      });
+      expect(chat.answer).toBe("entry import answer");
+      expect(chat.clientExport).toBe("_lr");
     } finally {
       mock.stop();
     }

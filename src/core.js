@@ -368,11 +368,41 @@ export const buildResolverJs = (
       const cleanPath = String(url ?? "").split("?")[0];
       return cleanPath.includes("/app-initial-") && cleanPath.endsWith(".js");
     });
-    return { appSharedUrl, appInitialUrl, primaryUrl: appSharedUrl ?? appInitialUrl };
+    return { urls, appSharedUrl, appInitialUrl, primaryUrl: appSharedUrl ?? appInitialUrl };
+  };
+
+  // ChatGPT.app 26.1027 起資源計時清單不再列出 app-initial（只剩一兩筆），改從入口 script
+  // 的 import 原文找它的網址。只追兩層、最多讀 12 個檔，並跳過數 MB 的 app-shared，
+  // 避免把整個 bundle 讀一遍。
+  const discoverAppInitialUrl = async (knownUrls, skipUrls) => {
+    const appInitialRef = /["'\`]\\.\\/(app-initial-[\\w-]+\\.js)["'\`]/;
+    const moduleRef = /["'\`]\\.\\/([\\w.-]+\\.js)["'\`]/g;
+    const seen = new Set(skipUrls);
+    let frontier = knownUrls.filter((url) => String(url ?? "").split("?")[0].endsWith(".js"));
+    let fetched = 0;
+    for (let depth = 0; depth < 2 && frontier.length > 0; depth += 1) {
+      const next = [];
+      for (const url of frontier) {
+        if (seen.has(url) || fetched >= 12) continue;
+        seen.add(url);
+        fetched += 1;
+        let text;
+        try {
+          text = await (await fetch(url)).text();
+        } catch {
+          continue;
+        }
+        const found = text.match(appInitialRef);
+        if (found) return new URL(found[1], url).href;
+        for (const match of text.matchAll(moduleRef)) next.push(new URL(match[1], url).href);
+      }
+      frontier = next;
+    }
+    return undefined;
   };
 
   const attestedClient = async () => {
-    const { appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
+    const { urls, appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
     if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
     // 每筆都拿新 challenge、不快取：2026-10-20 被標記期間沿用快取 challenge 的請求幾秒內就被
     // 403「Unusual activity has been detected from your device」拒收；改成每筆新拿後 17 筆 0 拒收。
@@ -385,9 +415,12 @@ export const buildResolverJs = (
       });
     let moduleUrl = primaryUrl;
     let resolved = await resolveChatGPTClient(await import(moduleUrl), attestationProbe);
-    if (!resolved.client && appSharedUrl && appInitialUrl) {
-      moduleUrl = appInitialUrl;
-      resolved = await resolveChatGPTClient(await import(appInitialUrl), attestationProbe);
+    if (!resolved.client && appSharedUrl) {
+      const fallbackUrl = appInitialUrl ?? await discoverAppInitialUrl(urls, [appSharedUrl]);
+      if (fallbackUrl) {
+        moduleUrl = fallbackUrl;
+        resolved = await resolveChatGPTClient(await import(fallbackUrl), attestationProbe);
+      }
     }
     if (!resolved.client) {
       return {
