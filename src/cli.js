@@ -14,8 +14,6 @@ import {
   sendConversation,
 } from "./core.js";
 
-const RENDER_EXPRESSION_KINDS = ["probe", "models", "chat", "resolver"];
-
 const pluginVersion = () => {
   try {
     const raw = fs.readFileSync(
@@ -84,9 +82,9 @@ export const runCli = async (
       writeStdout(buildChatExpression(options, preferred));
       return 0;
     }
-    // 呼叫端靠版本號與支援清單判斷「已安裝的外掛太舊、不認得這個類型」。
+    // 呼叫端靠版本號判斷「已安裝的外掛太舊、不認得這個類型」。
     writeStderr(
-      `不支援的 expression 類型：${kind ?? ""}（magpie-chatgpt-desktop ${pluginVersion()}，支援：${RENDER_EXPRESSION_KINDS.join(", ")}）\n`,
+      `不支援的 expression 類型：${kind ?? ""}（magpie-chatgpt-desktop ${pluginVersion()}）\n`,
     );
     return 1;
   }

@@ -47,23 +47,6 @@ When you click **Sign in** on the **ChatGPT Desktop** provider in Magpie:
 2. **Automatic free high port on launch (`58000–65000`):** Scans `127.0.0.1` for an unoccupied TCP port when launching or restarting `ChatGPT.app`.
 3. **Default fallback (`19333`):** Used when no explicit port or high port is selected.
 
-## Resolver snippet for renderer scripts
-
-`magpie-chatgpt-desktop --render-expression resolver` prints a plain JS snippet (no IIFE) that defines `resolveChatGPTClient` and `attestedClient(probe)`. Concatenate it with your own renderer JS and evaluate the result over CDP; the plugin's own `probe`, `models` and `chat` expressions embed this same snippet, so there is a single module resolver.
-
-`attestedClient(probe)` returns `{ client, exportName, probeValue, candidates, tried, moduleUrl }`, or `{ error, stage }` on failure. Without an argument each candidate is verified with the read-only attestation GET. Pass your own `probe` to decide candidates yourself, including one that sends no request at all (for example a shape check). If `probe` throws for a candidate, the error is recorded in `tried` and the next candidate is used.
-
-```js
-const snippet = execSync("magpie-chatgpt-desktop --render-expression resolver", { encoding: "utf8" });
-const expression = `(async () => {
-${snippet}
-  const resolved = await attestedClient(async (client) => typeof client.safeGet === "function");
-  return { exportName: resolved.exportName, error: resolved.error, tried: resolved.tried };
-})()`;
-```
-
-An unknown `--render-expression` type exits non-zero; the error on stderr names the installed plugin version and the supported types, so callers can tell that the installed version is too old.
-
 ## Limitations
 
 - **Text-only (`tool_call: false`):** All models declare `tool_call: false` and text-only input/output. Requests with images, audio, files, or tool roles are rejected with HTTP `400` before any CDP call.

@@ -1948,7 +1948,7 @@ ${out}
     }
   });
 
-  test("不認得的 --render-expression 類型回非 0，錯誤訊息帶外掛版本與支援清單", async () => {
+  test("不認得的 --render-expression 類型回非 0，錯誤訊息帶外掛版本", async () => {
     const { version } = JSON.parse(
       fs.readFileSync(path.resolve(__dirname, "../package.json"), "utf8"),
     );
@@ -1960,8 +1960,5 @@ ${out}
     expect(out).toBe("");
     expect(err).toContain("no-such-kind");
     expect(err).toContain(version);
-    for (const kind of ["probe", "models", "chat", "resolver"]) {
-      expect(err).toContain(kind);
-    }
   });
 });
