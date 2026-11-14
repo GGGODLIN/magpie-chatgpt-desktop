@@ -357,6 +357,7 @@ export const buildResolverJs = (
 
   const clientModuleUrls = () => {
     const urls = [...new Set([
+      ...(typeof __magpieLoadedClientModuleUrls === "undefined" ? [] : __magpieLoadedClientModuleUrls),
       ...performance.getEntriesByType("resource").map((entry) => entry.name),
       ...[...document.querySelectorAll("script[src],link[href]")].map((node) => node.src ?? node.href),
     ])];
@@ -1319,6 +1320,22 @@ export const evaluateInRenderer = ({
     let wsOpened = false;
     let ws = null;
     let timer = null;
+    let discoveryAttempted = false;
+    let resolutionFailure = null;
+    const loadedModuleUrls = new Set();
+
+    const sendEvaluation = (moduleUrls) => ws.send(JSON.stringify({
+      id: 1,
+      method: "Runtime.evaluate",
+      params: {
+        // 網址只供這次解析使用，不在 renderer 全域留下跨請求或跨版本的快取。
+        expression: moduleUrls
+          ? `((__magpieLoadedClientModuleUrls) => (${expression}))(${JSON.stringify(moduleUrls)})`
+          : expression,
+        returnByValue: true,
+        awaitPromise: true,
+      },
+    }));
 
     const cleanup = () => {
       if (timer !== null) {
@@ -1399,17 +1416,7 @@ export const evaluateInRenderer = ({
       if (settled) return;
       wsOpened = true;
       try {
-        ws.send(
-          JSON.stringify({
-            id: 1,
-            method: "Runtime.evaluate",
-            params: {
-              expression,
-              returnByValue: true,
-              awaitPromise: true,
-            },
-          }),
-        );
+        sendEvaluation();
       } catch (error) {
         fail(
           new ChatGPTDesktopError(`CDP 連線中斷：${error?.message ?? error}`, {
@@ -1444,6 +1451,32 @@ export const evaluateInRenderer = ({
           ),
         );
         return;
+      }
+
+      if (resolutionFailure && message?.method === "Debugger.scriptParsed") {
+        const url = message.params?.url;
+        if (typeof url === "string" && /^app:\/\/-\/assets\/app-(?:shared|initial)-[\w-]+\.js(?:\?[^#]*)?$/.test(url)) {
+          loadedModuleUrls.add(url);
+        }
+        return;
+      }
+
+      if (resolutionFailure && (message?.id === 2 || message?.id === 3)) {
+        try {
+          if (message.id === 2 && !message.error) {
+            ws.send(JSON.stringify({ id: 3, method: "Debugger.disable", params: {} }));
+            return;
+          }
+          if (message.id === 3 && !message.error && loadedModuleUrls.size > 0) {
+            sendEvaluation([...loadedModuleUrls]);
+            resolutionFailure = null;
+            return;
+          }
+        } catch {
+          // 除錯能力不可用時保留原解析錯誤，不能因此重送未知狀態的請求。
+        }
+        message = { id: 1, result: { result: { value: resolutionFailure } } };
+        resolutionFailure = null;
       }
 
       if (message?.id !== 1) return;
@@ -1484,6 +1517,23 @@ export const evaluateInRenderer = ({
           }),
         );
         return;
+      }
+
+      // 新版 app 隱藏資源計時且禁止 fetch app:// 資產；CDP 仍能列出已載入的模組。
+      // 只補查一次送出前的解析失敗；認證拒絕與送出後的錯誤一律維持原處理。
+      if (!discoveryAttempted
+        && value.error != null
+        && ["module_not_found", "client_not_found"].includes(value.stage)
+        && value.retrySafe !== false
+        && (!generation || value.retrySafe === true)) {
+        discoveryAttempted = true;
+        resolutionFailure = value;
+        try {
+          ws.send(JSON.stringify({ id: 2, method: "Debugger.enable", params: {} }));
+          return;
+        } catch {
+          resolutionFailure = null;
+        }
       }
 
       if (
