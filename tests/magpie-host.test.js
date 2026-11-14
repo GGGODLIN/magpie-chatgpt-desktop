@@ -1,3 +1,4 @@
+import "./no-real-app-env.js";
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";

@@ -1,3 +1,4 @@
+import "./no-real-app-env.js";
 import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
