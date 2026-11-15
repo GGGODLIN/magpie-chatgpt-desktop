@@ -202,4 +202,105 @@ describe("資源清單與入口讀取都找不到已載入的 client 模組", ()
       }
     });
   }
+
+  test("26.1029 數字檔名 Rspack 入口經 __webpack_require__.c 解析 client 並救回 <| 殭屍串流", async () => {
+    const rspackEntryUrl = "app://-/assets/348410.ae8bb87271.js";
+    const rspackDataUrl = dataModule(`
+      const rspackClient = {
+        safeGet: async (path) => path === "/ios/attestation_challenge"
+          ? { attestation_challenge: "rspack-challenge" }
+          : { models: [{ slug: "gpt-6-thinking", title: "GPT-6" }] },
+        streamPost: (_path, options) => {
+          options.onEvent({ data: {
+            conversation_id: "zombie-conv-1",
+            message: {
+              author: { role: "assistant" },
+              channel: "final",
+              status: "in_progress",
+              create_time: 10,
+              content: { content_type: "text", parts: ["<escape>{\\"tag\\":\\"none\\"}<|garbage"] },
+              metadata: { model_slug: "gpt-6-thinking" },
+            },
+          } });
+          options.onPrematureTermination();
+        },
+        cancelStream() {},
+      };
+      export const __webpack_require__ = {
+        c: {
+          sJS8: { id: "sJS8", exports: { $t: rspackClient } },
+        },
+      };
+    //`) + "#/assets/348410.ae8bb87271.js";
+
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req, srv) {
+        if (new URL(req.url).pathname === "/json/list") {
+          return Response.json([{
+            type: "page",
+            url: "app://-/index.html",
+            webSocketDebuggerUrl: `ws://127.0.0.1:${srv.port}/renderer`,
+          }]);
+        }
+        if (srv.upgrade(req)) return;
+        return new Response("Not found", { status: 404 });
+      },
+      websocket: {
+        async message(ws, raw) {
+          const command = JSON.parse(String(raw));
+          if (command.method === "Debugger.enable") {
+            ws.send(JSON.stringify({ method: "Debugger.scriptParsed", params: { url: rspackEntryUrl } }));
+            ws.send(JSON.stringify({ id: command.id, result: {} }));
+            return;
+          }
+          if (command.method === "Debugger.disable") {
+            ws.send(JSON.stringify({ id: command.id, result: {} }));
+            return;
+          }
+          const expression = command.params.expression.replaceAll(rspackEntryUrl, rspackDataUrl);
+          const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+          const evaluate = new AsyncFunction("performance", "document", "fetch", `return await ${expression};`);
+          const value = await evaluate(
+            { getEntriesByType: () => [] },
+            { querySelectorAll: () => [{ src: rspackDataUrl }] },
+            async () => { throw new Error("Asset fetch unavailable"); },
+          );
+          ws.send(JSON.stringify({ id: command.id, result: { result: { value } } }));
+        },
+      },
+    });
+
+    try {
+      const cdpUrl = `http://127.0.0.1:${server.port}`;
+      let probeOut = "";
+      const code = await runCli(["--probe"], {
+        cdpUrl,
+        env: {},
+        writeStdout: (t) => { probeOut += t; },
+      });
+      expect(code).toBe(0);
+      expect(JSON.parse(probeOut)).toMatchObject({
+        ok: true,
+        clientExport: "sJS8.$t",
+        challengeOk: true,
+      });
+
+      const chat = await sendConversation({
+        cdpUrl,
+        env: {},
+        model: "gpt-6-thinking",
+        effort: "standard",
+        prompt: "synthetic prompt",
+      });
+      expect(chat).toMatchObject({
+        answer: '{"tag":"none"}',
+        model: "gpt-6-thinking",
+        conversationId: "zombie-conv-1",
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
 });

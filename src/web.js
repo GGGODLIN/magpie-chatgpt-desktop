@@ -42,11 +42,19 @@ export const extractFinalAnswer = (conversation) => {
     .sort((a, b) => (a.create_time ?? 0) - (b.create_time ?? 0));
   const last = messages.at(-1);
   if (!last) return null;
-  // GPT-6 對純 JSON/XML 回答會包一層 <escape>（桌面版 core.js 的 unwrapDilEscape 同理；那份在 renderer 字串裡共用不到）。
+  // GPT-6 對純 JSON/XML 回答會包一層 <escape>，且裸 JSON 結尾漏出 <| 時後端會把狀態卡在 in_progress。
   const raw = (last.content.parts ?? []).filter((part) => typeof part === "string").join("").trim();
+  const ltPipe = raw.indexOf("<|");
+  const withoutZombie = ltPipe !== -1 ? raw.slice(0, ltPipe).trim() : raw;
+  const text = withoutZombie.startsWith("<escape>") && withoutZombie.endsWith("</escape>")
+    ? withoutZombie.slice(8, -9).trim()
+    : withoutZombie.startsWith("<escape>")
+      ? withoutZombie.slice(8).replace(/<\/escape>\s*$/, "").trim()
+      : withoutZombie;
+  const zombieCompleted = last.status === "in_progress" && ltPipe !== -1 && text.length > 0;
   return {
-    text: raw.startsWith("<escape>") && raw.endsWith("</escape>") ? raw.slice(8, -9).trim() : raw,
-    status: last.status ?? null,
+    text,
+    status: zombieCompleted ? "finished_successfully" : (last.status ?? null),
     model: last.metadata?.model_slug ?? null,
   };
 };
@@ -251,14 +259,23 @@ export const sendWebConversation = async ({
     if (postStatus >= 400) throw unavailable(`公司網頁版送出失敗（HTTP ${postStatus}）`, "send_rejected");
     if (!conversationId) throw rateLimited("公司網頁版送出後 90 秒沒拿到對話 ID", 30000);
 
-    // 跟桌面版撈答案同一套：stream_status 不吃讀取額度，結束後才讀一次整段對話。
+    // 跟桌面版撈答案同一套：stream_status 不吃讀取額度，結束後才讀一次整段對話；每 4 輪抽查一次是否已卡在 <| 殭屍結尾。
     let streamStatus = null;
+    let statusPolls = 0;
     while (Date.now() - started < timeoutMs) {
       if (signal?.aborted) throw unavailable("請求已取消", "aborted");
       const reply = await api(`/conversation/${conversationId}/stream_status`);
       if (reply.status === 429) throw rateLimited("公司網頁版讀取被限流（stream_status 429）", 10 * 60 * 1000);
       streamStatus = reply.status === 200 ? JSON.parse(reply.body).status : `http${reply.status}`;
       if (streamStatus !== "IS_STREAMING") break;
+      statusPolls += 1;
+      if (statusPolls % 4 === 0) {
+        const probeConv = await api(`/conversation/${conversationId}`);
+        if (probeConv.status === 200) {
+          const probeAns = extractFinalAnswer(JSON.parse(probeConv.body));
+          if (probeAns?.status === "finished_successfully" && probeAns.text) break;
+        }
+      }
       await sleep(5000);
     }
     for (let attempt = 0; attempt < 2; attempt++) {

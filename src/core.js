@@ -369,7 +369,55 @@ export const buildResolverJs = (
       const cleanPath = String(url ?? "").split("?")[0];
       return cleanPath.includes("/app-initial-") && cleanPath.endsWith(".js");
     });
-    return { urls, appSharedUrl, appInitialUrl, primaryUrl: appSharedUrl ?? appInitialUrl };
+    // ChatGPT.app 26.1029 起改由 Rspack 切出數字檔名入口（如 assets/348410.*.js）並匯出 __webpack_require__。
+    const rspackEntryUrls = urls.filter((url) => {
+      const cleanPath = String(url ?? "").split("?")[0];
+      return /\\/assets\\/\\d+\\.[\\w-]+\\.js$/.test(cleanPath);
+    });
+    return { urls, appSharedUrl, appInitialUrl, rspackEntryUrls, primaryUrl: appSharedUrl ?? appInitialUrl };
+  };
+
+  const resolveFromRspackEntries = async (entryUrls, probe) => {
+    const candidates = [];
+    const tried = [];
+    for (const entryUrl of entryUrls) {
+      let mod;
+      try {
+        mod = await import(entryUrl);
+      } catch {
+        continue;
+      }
+      const cache = mod?.__webpack_require__?.c;
+      if (!cache || typeof cache !== "object") continue;
+      const synthetic = {};
+      for (const [modId, modEntry] of Object.entries(cache)) {
+        const exportsObj = modEntry?.exports;
+        if (!exportsObj || (typeof exportsObj !== "object" && typeof exportsObj !== "function")) continue;
+        if (isChatGPTClient(exportsObj)) {
+          synthetic[modId] = exportsObj;
+        }
+        for (const key of Object.getOwnPropertyNames(exportsObj)) {
+          try {
+            const val = exportsObj[key];
+            if (isChatGPTClient(val)) {
+              synthetic[\`\${modId}.\${key}\`] = val;
+            }
+          } catch {
+            // 略過尚未就緒或帶副作用的匯出 getter。
+          }
+        }
+      }
+      const res = await resolveChatGPTClient(synthetic, probe);
+      candidates.push(...res.candidates);
+      tried.push(...res.tried);
+      if (res.client) {
+        return { ...res, moduleUrl: entryUrl, candidates, tried };
+      }
+    }
+    if (candidates.length > 0) {
+      return { client: null, exportName: null, candidates, tried, moduleUrl: entryUrls[0] };
+    }
+    return null;
   };
 
   // ChatGPT.app 26.1027 起資源計時清單不再列出 app-initial（只剩一兩筆），改從入口 script
@@ -405,8 +453,10 @@ export const buildResolverJs = (
   // probe 由呼叫端決定如何驗證候選；不傳時用唯讀 attestation 查詢。偵測器的形狀檢查可傳
   // 不發請求的 probe（例如 async () => true）。probe 對某候選拋錯只記進 tried、換下一個候選。
   const attestedClient = async (probe) => {
-    const { urls, appSharedUrl, appInitialUrl, primaryUrl } = clientModuleUrls();
-    if (!primaryUrl) return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
+    const { urls, appSharedUrl, appInitialUrl, rspackEntryUrls, primaryUrl } = clientModuleUrls();
+    if (!primaryUrl && rspackEntryUrls.length === 0) {
+      return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
+    }
     // 每筆都拿新 challenge、不快取：2026-10-20 被標記期間沿用快取 challenge 的請求幾秒內就被
     // 403「Unusual activity has been detected from your device」拒收；改成每筆新拿後 17 筆 0 拒收。
     const attestationProbe = (candidate) =>
@@ -417,8 +467,10 @@ export const buildResolverJs = (
         },
       });
     const activeProbe = typeof probe === "function" ? probe : attestationProbe;
-    let moduleUrl = primaryUrl;
-    let resolved = await resolveChatGPTClient(await import(moduleUrl), activeProbe);
+    let moduleUrl = primaryUrl ?? rspackEntryUrls[0];
+    let resolved = primaryUrl
+      ? await resolveChatGPTClient(await import(moduleUrl), activeProbe)
+      : { client: null, exportName: null, candidates: [], tried: [] };
     if (!resolved.client && appSharedUrl) {
       const fallbackUrl = appInitialUrl ?? await discoverAppInitialUrl(urls, [appSharedUrl]);
       if (fallbackUrl) {
@@ -426,6 +478,19 @@ export const buildResolverJs = (
         const firstTried = resolved.tried;
         resolved = await resolveChatGPTClient(await import(fallbackUrl), activeProbe);
         resolved = { ...resolved, tried: [...firstTried, ...resolved.tried] };
+      }
+    }
+    if (!resolved.client && rspackEntryUrls.length > 0) {
+      const rspackResolved = await resolveFromRspackEntries(rspackEntryUrls, activeProbe);
+      if (rspackResolved) {
+        moduleUrl = rspackResolved.moduleUrl ?? moduleUrl;
+        resolved = {
+          ...rspackResolved,
+          candidates: [...resolved.candidates, ...rspackResolved.candidates],
+          tried: [...resolved.tried, ...rspackResolved.tried],
+        };
+      } else if (!primaryUrl) {
+        return { error: "找不到 app-shared 或 app-initial 模組", stage: "module_not_found" };
       }
     }
     if (!resolved.client) {
@@ -882,18 +947,26 @@ ${buildResolverJs(preferredExports)}
 
     // 關閉 v1 delta 編碼後，/f/conversation 的 SSE 事件已直接攜帶 finished_successfully 的完稿 message；
     // 先從串流事件取答案可省去每回合結尾的 GET /conversation/{id}，避免高併發觸發讀取限流。
-    // 同时剝除 GPT-6 model_dil_v2 對純 JSON/XML 外層包裹的 <escape>...</escape>。
+    // 同時剝除 GPT-6 model_dil_v2 外層 <escape>...</escape>，以及裸 JSON 結尾漏出 <| 造成的殭屍截斷尾綴。
     const unwrapDilEscape = (raw) => {
-      const trimmed = String(raw ?? "").trim();
+      let trimmed = String(raw ?? "").trim();
+      const ltPipe = trimmed.indexOf("<|");
+      if (ltPipe !== -1) {
+        trimmed = trimmed.slice(0, ltPipe).trim();
+      }
       if (trimmed.startsWith("<escape>") && trimmed.endsWith("</escape>")) {
         return trimmed.slice(8, -9).trim();
+      }
+      if (trimmed.startsWith("<escape>")) {
+        return trimmed.slice(8).trim();
       }
       return trimmed;
     };
     let best = null;
-    const considerMessage = (message) => {
+    const considerMessage = (message, allowZombieLtPipe = false) => {
       if (message?.author?.role !== "assistant") return;
-      if (message?.status !== "finished_successfully") return;
+      const isFinished = message?.status === "finished_successfully";
+      if (!isFinished && !(allowZombieLtPipe && message?.status === "in_progress")) return;
       if (message?.recipient && message.recipient !== "all") return;
       if (message?.channel && message.channel !== "final") return;
       const content = message.content;
@@ -919,6 +992,7 @@ ${buildResolverJs(preferredExports)}
         : typeof content?.text === "string"
           ? content.text.trim()
           : "";
+      if (!isFinished && !rawText.includes("<|")) return;
       const text = unwrapDilEscape(rawText);
       if (!text) return;
       const at = message.create_time ?? 0;
@@ -933,6 +1007,7 @@ ${buildResolverJs(preferredExports)}
         };
       }
     };
+    const streamCandidates = [];
     for (const rawEv of events) {
       let ev = rawEv;
       if (typeof ev === "string") {
@@ -940,7 +1015,15 @@ ${buildResolverJs(preferredExports)}
       }
       const msgCandidate =
         ev?.data?.message ?? ev?.data?.v?.message ?? ev?.message ?? null;
-      if (msgCandidate) considerMessage(msgCandidate);
+      if (msgCandidate) {
+        streamCandidates.push(msgCandidate);
+        considerMessage(msgCandidate, false);
+      }
+    }
+    if (best === null) {
+      for (const msgCandidate of streamCandidates) {
+        considerMessage(msgCandidate, true);
+      }
     }
     // 對話已建立但串流斷掉時，用對話編號讀回背景寫完的答案，不白丟這則回答。
     // 讀取額度整個帳號共用且很緊：2026-10-20 多筆並行撈答案時 GET 大半回 "Too many requests"，
@@ -1020,9 +1103,11 @@ ${buildResolverJs(preferredExports)}
           }
           if (status !== lastStatus) readLog.push({ s: elapsed, status });
           lastStatus = status;
-          if (status === "IS_STREAMING") continue;
+          // GPT-6 裸 JSON 結尾漏出 <| 時後端會把 stream_status 卡死在 IS_STREAMING；每 4 次輪詢抽查一次是否已寫出 <|。
+          if (status === "IS_STREAMING" && statusPolls % 4 !== 0) continue;
+          const checkZombieOnly = status === "IS_STREAMING";
           // 剛轉 COMPLETE 時正文偶爾還沒落進 mapping，隔一輪再讀一次，最多兩次 GET。
-          for (let attempt = 0; attempt < 2 && best === null; attempt += 1) {
+          for (let attempt = 0; attempt < (checkZombieOnly ? 1 : 2) && best === null; attempt += 1) {
             if (attempt > 0) {
               const remainMs = deadline - Date.now();
               if (remainMs <= 0) break;
@@ -1048,9 +1133,18 @@ ${buildResolverJs(preferredExports)}
             entry.assistant = nodes
               .filter((message) => message.author?.role === "assistant")
               .map((message) => [message.content?.content_type, message.status, message.channel ?? "-"].join("/"));
-            for (const message of nodes) considerMessage(message);
+            if (!checkZombieOnly) {
+              for (const message of nodes) considerMessage(message, false);
+            }
+            if (best === null) {
+              for (const message of nodes) considerMessage(message, true);
+            }
             entry.found = best !== null;
             readLog.push(entry);
+          }
+          if (checkZombieOnly) {
+            if (best !== null || readRejected || unreadable) break;
+            continue;
           }
           // 串流已結束卻沒有完稿：2026-10-21 實測 gpt-6-instant 長回答會停在 in_progress、stream_status 卻報 COMPLETE，
           // 之後再也不會寫完，不必再等。
@@ -1080,7 +1174,12 @@ ${buildResolverJs(preferredExports)}
       const mapping = conversation?.mapping ?? {};
       best = null;
       for (const node of Object.values(mapping)) {
-        considerMessage(node?.message);
+        considerMessage(node?.message, false);
+      }
+      if (best === null) {
+        for (const node of Object.values(mapping)) {
+          considerMessage(node?.message, true);
+        }
       }
     }
     if (best === null) {
@@ -1455,7 +1554,7 @@ export const evaluateInRenderer = ({
 
       if (resolutionFailure && message?.method === "Debugger.scriptParsed") {
         const url = message.params?.url;
-        if (typeof url === "string" && /^app:\/\/-\/assets\/app-(?:shared|initial)-[\w-]+\.js(?:\?[^#]*)?$/.test(url)) {
+        if (typeof url === "string" && /^app:\/\/-\/assets\/(?:app-(?:shared|initial)-[\w-]+|\d+\.[\w-]+)\.js(?:\?[^#]*)?$/.test(url)) {
           loadedModuleUrls.add(url);
         }
         return;

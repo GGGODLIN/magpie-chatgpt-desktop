@@ -55,6 +55,26 @@ describe("extractFinalAnswer", () => {
   test("returns null when there is no assistant text", () => {
     expect(extractFinalAnswer({ mapping: {} })).toBe(null);
   });
+
+  test("strips <| zombie suffix and treats in_progress <| answer as finished_successfully", () => {
+    const conversation = {
+      mapping: Object.fromEntries([
+        node("z", {
+          author: { role: "assistant" },
+          channel: "final",
+          content: { content_type: "text", parts: ['{"tag":"none"}<|endoftext'] },
+          status: "in_progress",
+          create_time: 5,
+          metadata: { model_slug: "gpt-6-thinking" },
+        }),
+      ]),
+    };
+    expect(extractFinalAnswer(conversation)).toEqual({
+      text: '{"tag":"none"}',
+      status: "finished_successfully",
+      model: "gpt-6-thinking",
+    });
+  });
 });
 
 describe("checkDailyBudget", () => {
