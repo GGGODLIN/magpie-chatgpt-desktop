@@ -18,6 +18,125 @@ export const resetUnusualActivityCooldown = () => {
   unusualActivityUntil = 0;
 };
 
+export const safeJsonForJs = (value) =>
+  JSON.stringify(value)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+
+export const decodeBodyToString = (body) => {
+  if (typeof body === "string") return body;
+  if (body == null) return "{}";
+  if (Buffer.isBuffer(body)) return body.toString("utf8");
+  if (body instanceof ArrayBuffer) return Buffer.from(body).toString("utf8");
+  if (ArrayBuffer.isView(body)) {
+    return Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8");
+  }
+  return String(body);
+};
+
+export const redactSecrets = (text) => {
+  const raw = String(text ?? "");
+  return raw
+    .replace(/((?:https?|wss?):\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    .replace(/((?:authorization|cookie|set-cookie|x-api-key|api-key)[ \t]*:[ \t]*)[^\r\n]+/gi, "$1[REDACTED]")
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g, "[REDACTED_JWT]")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_KEY]")
+    .replace(
+      /("(?:accessToken|access_token|refresh_token|id_token|session_token|attestation_challenge|resume_conversation_token|apiKey|api_key|authorization|cookie|set-cookie)"\s*:\s*)"(?:[^"\\]|\\.)*"/gi,
+      '$1"[REDACTED]"',
+    )
+    .replace(
+      /("(?:accessToken|access_token|refresh_token|id_token|session_token|attestation_challenge|resume_conversation_token|apiKey|api_key|authorization|cookie|set-cookie)"\s*:\s*)\[\s*"(?:[^"\\]|\\.)*"(?:\s*,\s*"(?:[^"\\]|\\.)*")*\s*\]/gi,
+      '$1["[REDACTED]"]',
+    )
+    .replace(
+      /((?:__Secure-next-auth\.session-token|__Host-next-auth\.csrf-token|oai-did|cf_clearance)=)[^\s;,]+/gi,
+      "$1[REDACTED]",
+    );
+};
+
+export const createSerialQueue = () => {
+  let active = false;
+  const waiting = [];
+  const pump = () => {
+    if (active) return;
+    while (waiting.length > 0) {
+      const next = waiting.shift();
+      if (next.cancelled) continue;
+      active = true;
+      next.start();
+      return;
+    }
+  };
+  const run = (fn, signal) =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(
+          new ChatGPTDesktopError("請求已取消", {
+            stage: "aborted",
+            retrySafe: true,
+            status: 502,
+            details: { aborted: true },
+          }),
+        );
+        return;
+      }
+      const entry = { cancelled: false, start: null };
+      const onAbort = () => {
+        entry.cancelled = true;
+        const idx = waiting.indexOf(entry);
+        if (idx !== -1) waiting.splice(idx, 1);
+        reject(
+          new ChatGPTDesktopError("請求已取消", {
+            stage: "aborted",
+            retrySafe: true,
+            status: 502,
+            details: { aborted: true },
+          }),
+        );
+      };
+      if (signal && typeof signal.addEventListener === "function") {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+      entry.start = () => {
+        if (signal && typeof signal.removeEventListener === "function") {
+          signal.removeEventListener("abort", onAbort);
+        }
+        if (signal?.aborted) {
+          active = false;
+          reject(
+            new ChatGPTDesktopError("請求已取消", {
+              stage: "aborted",
+              retrySafe: true,
+              status: 502,
+              details: { aborted: true },
+            }),
+          );
+          pump();
+          return;
+        }
+        Promise.resolve()
+          .then(() => fn())
+          .then(
+            (value) => {
+              active = false;
+              resolve(value);
+              pump();
+            },
+            (error) => {
+              active = false;
+              reject(error);
+              pump();
+            },
+          );
+      };
+      waiting.push(entry);
+      pump();
+    });
+  return { run };
+};
+
 export const estimateTokenCount = (text) => {
   const str = String(text ?? "");
   let ascii = 0;
@@ -247,13 +366,26 @@ export const getRendererTarget = async ({
   cdpUrl,
   fetchImpl = fetch,
   timeoutMs = 4000,
+  signal,
 } = {}) => {
+  if (signal?.aborted) {
+    throw new ChatGPTDesktopError("請求已取消", {
+      stage: "aborted",
+      retrySafe: true,
+      status: 502,
+      details: { aborted: true },
+    });
+  }
   const baseUrl = String(cdpUrl ?? `http://127.0.0.1:${DEFAULT_CDP_PORT}`).replace(
     /\/+$/,
     "",
   );
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (signal && typeof signal.addEventListener === "function") {
+    signal.addEventListener("abort", onExternalAbort, { once: true });
+  }
   let targets;
   try {
     const response = await fetchImpl(`${baseUrl}/json/list`, {
@@ -267,6 +399,15 @@ export const getRendererTarget = async ({
       throw new Error("Targets response is not an array");
     }
   } catch (error) {
+    if (signal?.aborted) {
+      throw new ChatGPTDesktopError("請求已取消", {
+        stage: "aborted",
+        retrySafe: true,
+        status: 502,
+        details: { aborted: true },
+        cause: error,
+      });
+    }
     throw new ChatGPTDesktopError(`連不上 Codex Desktop 的 CDP（${baseUrl}）`, {
       stage: "cdp_unreachable",
       retrySafe: true,
@@ -276,6 +417,9 @@ export const getRendererTarget = async ({
     });
   } finally {
     clearTimeout(timer);
+    if (signal && typeof signal.removeEventListener === "function") {
+      signal.removeEventListener("abort", onExternalAbort);
+    }
   }
 
   const pages = targets.filter(
@@ -313,30 +457,47 @@ export const getRendererTarget = async ({
 export const buildResolverJs = (
   preferredExports = preferredClientExports(),
 ) => `
-  const preferredClientExports = ${JSON.stringify(preferredExports)};
+  const preferredClientExports = ${safeJsonForJs(preferredExports)};
 
-  const isChatGPTClient = (value) => !!value
-    && (typeof value === "object" || typeof value === "function")
-    && String(value.safeGet) !== "[object RpcPromise]"
-    && typeof value.safeGet === "function"
-    && typeof value.streamPost === "function"
-    && typeof value.cancelStream === "function";
+  const isChatGPTClient = (value) => {
+    try {
+      if (!value || (typeof value !== "object" && typeof value !== "function")) return false;
+      const safeGet = value.safeGet;
+      if (typeof safeGet !== "function") return false;
+      if (String(safeGet) === "[object RpcPromise]") return false;
+      return typeof value.streamPost === "function" && typeof value.cancelStream === "function";
+    } catch {
+      return false;
+    }
+  };
 
   const chatGPTClientCandidates = (moduleNamespace) => {
-    const names = Object.keys(moduleNamespace);
-    const rest = names.filter((name) => !preferredClientExports.includes(name)).sort();
+    if (!moduleNamespace || (typeof moduleNamespace !== "object" && typeof moduleNamespace !== "function")) {
+      return [];
+    }
+    const entries = [];
+    for (const name of Object.keys(moduleNamespace)) {
+      try {
+        const value = moduleNamespace[name];
+        entries.push({ name, value, isObject: typeof value === "object" });
+      } catch {
+      }
+    }
+    const entryMap = new Map(entries.map((entry) => [entry.name, entry]));
+    const rest = entries
+      .filter((entry) => !preferredClientExports.includes(entry.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
     const ordered = [
-      ...preferredClientExports.filter((name) => names.includes(name)),
-      ...rest.filter((name) => typeof moduleNamespace[name] === "object"),
-      ...rest.filter((name) => typeof moduleNamespace[name] !== "object"),
+      ...preferredClientExports.map((name) => entryMap.get(name)).filter(Boolean),
+      ...rest.filter((entry) => entry.isObject),
+      ...rest.filter((entry) => !entry.isObject),
     ];
     const seen = new Set();
     const candidates = [];
-    for (const name of ordered) {
-      const value = moduleNamespace[name];
-      if (!isChatGPTClient(value) || seen.has(value)) continue;
-      seen.add(value);
-      candidates.push({ name, client: value });
+    for (const entry of ordered) {
+      if (!isChatGPTClient(entry.value) || seen.has(entry.value)) continue;
+      seen.add(entry.value);
+      candidates.push({ name: entry.name, client: entry.value });
     }
     return candidates;
   };
@@ -389,7 +550,7 @@ export const buildResolverJs = (
       }
       const cache = mod?.__webpack_require__?.c;
       if (!cache || typeof cache !== "object") continue;
-      const synthetic = {};
+      const synthetic = Object.create(null);
       for (const [modId, modEntry] of Object.entries(cache)) {
         const exportsObj = modEntry?.exports;
         if (!exportsObj || (typeof exportsObj !== "object" && typeof exportsObj !== "function")) continue;
@@ -403,7 +564,6 @@ export const buildResolverJs = (
               synthetic[\`\${modId}.\${key}\`] = val;
             }
           } catch {
-            // 略過尚未就緒或帶副作用的匯出 getter。
           }
         }
       }
@@ -467,17 +627,28 @@ export const buildResolverJs = (
         },
       });
     const activeProbe = typeof probe === "function" ? probe : attestationProbe;
+    const safeImport = async (url) => {
+      try {
+        return await import(url);
+      } catch {
+        return null;
+      }
+    };
     let moduleUrl = primaryUrl ?? rspackEntryUrls[0];
-    let resolved = primaryUrl
-      ? await resolveChatGPTClient(await import(moduleUrl), activeProbe)
+    let primaryMod = primaryUrl ? await safeImport(moduleUrl) : null;
+    let resolved = primaryMod
+      ? await resolveChatGPTClient(primaryMod, activeProbe)
       : { client: null, exportName: null, candidates: [], tried: [] };
     if (!resolved.client && appSharedUrl) {
       const fallbackUrl = appInitialUrl ?? await discoverAppInitialUrl(urls, [appSharedUrl]);
       if (fallbackUrl) {
         moduleUrl = fallbackUrl;
         const firstTried = resolved.tried;
-        resolved = await resolveChatGPTClient(await import(fallbackUrl), activeProbe);
-        resolved = { ...resolved, tried: [...firstTried, ...resolved.tried] };
+        const fallbackMod = await safeImport(fallbackUrl);
+        if (fallbackMod) {
+          resolved = await resolveChatGPTClient(fallbackMod, activeProbe);
+          resolved = { ...resolved, tried: [...firstTried, ...resolved.tried] };
+        }
       }
     }
     if (!resolved.client && rspackEntryUrls.length > 0) {
@@ -599,8 +770,10 @@ export const buildChatExpression = (
   };
   return `(async () => {
   const coolingDown = () => {
-    const waitMs = (globalThis.__magpieUnusualActivityUntil ?? 0) - Date.now();
-    if (waitMs <= 0) return null;
+    const until = globalThis.__magpieUnusualActivityUntil;
+    if (typeof until !== "number" || !Number.isFinite(until)) return null;
+    const waitMs = until - Date.now();
+    if (!Number.isFinite(waitMs) || waitMs <= 0) return null;
     return {
       error: "ChatGPT Desktop 送出間隔冷卻中（rate_limit_exceeded），請稍後再試",
       stage: "rate_limited",
@@ -611,7 +784,7 @@ export const buildChatExpression = (
     };
   };
   if (coolingDown()) return coolingDown();
-  const options = ${JSON.stringify(normalizedOptions)};
+  const options = ${safeJsonForJs(normalizedOptions)};
   const events = [];
   let sendAttempted = false;
   let streamError = null;
@@ -695,32 +868,46 @@ ${buildResolverJs(preferredExports)}
     let sends = [];
     let storedBudget = null;
     try {
-      sends = JSON.parse(localStorage.getItem("magpieSendTimes") ?? "[]")
-        .filter((at) => typeof at === "number" && Date.now() - at < DAY_MS);
+      const parsedSends = JSON.parse(localStorage.getItem("magpieSendTimes") ?? "[]");
+      if (Array.isArray(parsedSends)) {
+        sends = parsedSends
+          .filter((at) => typeof at === "number" && Number.isFinite(at) && Date.now() - at < DAY_MS)
+          .sort((a, b) => a - b);
+      }
       const raw = Number(localStorage.getItem("magpieDailyBudget"));
       if (Number.isFinite(raw) && raw > 0) storedBudget = raw;
     } catch {}
     const dailyBudget = globalThis.__magpieDailyBudget ?? storedBudget ?? options.dailyBudget ?? null;
-    if (typeof dailyBudget === "number" && sends.length >= dailyBudget) {
+    if (typeof dailyBudget === "number" && Number.isFinite(dailyBudget) && sends.length >= dailyBudget) {
+      const oldest = dailyBudget > 0 ? sends[sends.length - dailyBudget] : undefined;
+      const waitMs = typeof oldest === "number" && Number.isFinite(oldest)
+        ? Math.max(60000, oldest + DAY_MS - Date.now())
+        : DAY_MS;
       return {
         error: "ChatGPT Desktop 已用完 24 小時預算（" + sends.length + "/" + dailyBudget + "，rate_limit_exceeded）",
         stage: "rate_limited",
         retrySafe: true,
         outcome: "daily_budget",
-        retryAfterMs: Math.max(60000, sends[sends.length - dailyBudget] + DAY_MS - Date.now()),
+        retryAfterMs: waitMs,
       };
     }
     try {
       localStorage.setItem("magpieSendTimes", JSON.stringify([...sends, Date.now()]));
     } catch {}
 
-    const outcome = await new Promise((resolve) => {
+    const streamResult = await new Promise((resolve) => {
       let settled = false;
       const done = (why) => { if (!settled) { settled = true; resolve(why); } };
-      const remember = (value) => { if (value != null) events.push(value); };
+      const remember = (value) => { if (!settled && value != null) events.push(value); };
+      const onStreamError = (error) => {
+        if (settled) return;
+        streamError = error;
+        remember(error);
+        done("error");
+      };
       try {
         sendAttempted = true;
-        client.streamPost("/f/conversation", {
+        const handle = client.streamPost("/f/conversation", {
           additionalHeaders: { "X-OpenAI-Attach-Desktop-Surface": "1" },
           body: JSON.stringify(body),
           chatgptSse: {},
@@ -728,20 +915,81 @@ ${buildResolverJs(preferredExports)}
           onEvent: remember,
           onStreamData: remember,
           onComplete: (value) => { remember(value); done("complete"); },
-          onError: (value) => { streamError = value; remember(value); done("error"); },
+          onError: onStreamError,
           onPrematureTermination: () => done("premature"),
         });
+        Promise.resolve(handle).catch((error) => {
+          // A rejected handle cannot confirm that the server refused the send.
+          remember(error);
+          done("handle_rejected");
+        });
       } catch (error) {
-        streamError = error;
-        done("error");
+        onStreamError(error);
       }
     });
+    const handleRejected = streamResult === "handle_rejected";
+    const outcome = handleRejected ? "error" : streamResult;
+
+    const parseJsonCandidates = (raw) => {
+      if (raw == null) return [];
+      if (typeof raw !== "string") return [raw];
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed === "[DONE]") return [];
+      const direct = trimmed.replace(/^data:\\s*/i, "");
+      if (direct && direct !== "[DONE]") {
+        try {
+          return [JSON.parse(direct)];
+        } catch {}
+      }
+      const parsed = [];
+      if (trimmed.includes("\\n")) {
+        const blocks = trimmed.split(/\\r?\\n\\r?\\n/);
+        for (const block of blocks) {
+          const dataLines = block
+            .split(/\\r?\\n/)
+            .filter((line) => /^data:/i.test(line.trim()))
+            .map((line) => line.trim().replace(/^data:\\s*/i, ""))
+            .filter((line) => line && line !== "[DONE]");
+          if (dataLines.length > 0) {
+            try {
+              parsed.push(JSON.parse(dataLines.join("\\n")));
+              continue;
+            } catch {}
+            for (const line of dataLines) {
+              try {
+                parsed.push(JSON.parse(line));
+              } catch {}
+            }
+          } else {
+            for (const line of block.split(/\\r?\\n/)) {
+              const clean = line.trim();
+              if (!clean || clean === "[DONE]") continue;
+              try {
+                parsed.push(JSON.parse(clean));
+              } catch {}
+            }
+          }
+        }
+      }
+      return parsed;
+    };
+    const withTimeout = (promise, label, ms = 20000) => {
+      let timerId;
+      const timeoutPromise = new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error(label + " timeout " + Math.round(ms / 1000) + "s")), ms);
+      });
+      return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timerId));
+    };
 
     const seen = new Set();
     let assistantSeen = false;
-    const findId = (value) => {
+    const findId = (value, depth = 0) => {
+      if (depth > 64) return null;
       if (typeof value === "string") {
-        try { value = JSON.parse(value); } catch { return null; }
+        for (const parsed of parseJsonCandidates(value)) {
+          findId(parsed, depth + 1);
+        }
+        return conversationId;
       }
       if (value == null || typeof value !== "object" || seen.has(value)) return null;
       seen.add(value);
@@ -749,25 +997,11 @@ ${buildResolverJs(preferredExports)}
       const direct = value.conversation_id ?? value.conversationId;
       if (typeof direct === "string" && direct) conversationId ??= direct;
       for (const [key, item] of Object.entries(value)) {
-        if (!["content", "parts", "text"].includes(key)) findId(item);
+        if (!["content", "parts", "text"].includes(key)) findId(item, depth + 1);
       }
       return conversationId;
     };
-    events.forEach(findId);
-
-    // 串流開頭會帶 resume_conversation_token；App 靠它在串流中斷後打 /f/conversation/resume 接回同一則回答，
-    // 沒有這張憑證續傳會回 404 tokenless_resume_unavailable（2026-10-21 實測）。
-    let resumeToken = null;
-    for (const rawEv of events) {
-      let data = rawEv?.data ?? rawEv;
-      if (typeof data === "string") {
-        try { data = JSON.parse(data); } catch { continue; }
-      }
-      if (data?.type === "resume_conversation_token" && typeof data.token === "string") {
-        resumeToken = data.token;
-        break;
-      }
-    }
+    events.forEach((ev) => findId(ev, 0));
 
     // 只在結構化錯誤欄位遞迴；若外層已有非 model_cap_exceeded 的 code/type（如 rate_limit_exceeded），
     // 不得誤信內層 message 字串中的 model_cap_exceeded 而觸發重送。
@@ -791,40 +1025,27 @@ ${buildResolverJs(preferredExports)}
       }
       return null;
     };
-    // 限流期伺服器仍會生完回答；先留原始錯誤與對話編號，才能判斷能否回頭撈答案。只記事件形狀，不存 prompt。
+    const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
     if (outcome !== "complete") {
-      const describe = (value) => {
-        if (typeof value === "string") {
-          try { value = JSON.parse(value); } catch { return "text:" + value.slice(0, 120); }
-        }
-        if (!value || typeof value !== "object") return typeof value;
-        return [value.type, value.event, value.message?.author?.role, value.message?.status]
-          .filter(Boolean).join("/") || Object.keys(value).slice(0, 6).join(",");
-      };
-      let errorText;
-      try {
-        errorText = JSON.stringify(streamError, Object.getOwnPropertyNames(streamError ?? {}));
-      } catch {
-        errorText = String(streamError);
-      }
+      // 串流資料可能含對話原文與憑證，診斷只保留形狀與憑證是否出現。
+      const hasResumeToken = events.some((raw) => parseJsonCandidates(raw).some((event) => {
+        const payloads = event?.data !== undefined ? parseJsonCandidates(event.data) : [event];
+        return payloads.some((data) => data?.type === "resume_conversation_token" && typeof data.token === "string");
+      }));
       const diag = {
         at: new Date().toISOString(),
         outcome,
         conversationId,
         assistantSeen,
         eventCount: events.length,
-        eventShapes: events.slice(0, 40).map(describe),
-        streamError: (errorText ?? "").slice(0, 4000),
+        eventShapes: events.slice(0, 40).map((value) => Array.isArray(value) ? "array" : typeof value),
+        errorCode,
         recoverWithinMs: options.recoverWithinMs ?? null,
         model: requestModel,
-        hasResumeToken: resumeToken !== null,
+        hasResumeToken,
       };
-      if (resumeToken !== null && conversationId) {
-        globalThis.__magpieLastResume = { conversationId, token: resumeToken, at: Date.now() };
-      }
       globalThis.__magpieStreamDiag = [...(globalThis.__magpieStreamDiag ?? []), diag].slice(-20);
     }
-    const errorCode = outcome === "error" ? recognizedErrorCode(streamError) : null;
     if (
       (errorCode === "input_too_large" || errorCode === "message_length_exceeds_limit") &&
       !conversationId &&
@@ -857,17 +1078,21 @@ ${buildResolverJs(preferredExports)}
       }
       recordReset(requestModel, errObj?.resets_after ?? errObj?.error?.resets_after ?? errObj?.detail?.resets_after);
       try {
-        const init = await client.safePost("/conversation/init", {
-          requestBody: {
-            conversation_id: null,
-            conversation_origin: null,
-            gizmo_id: null,
-            requested_default_model: requestModel,
-            system_hints: null,
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            timezone_offset_min: new Date().getTimezoneOffset(),
-          },
-        });
+        const init = await withTimeout(
+          client.safePost("/conversation/init", {
+            requestBody: {
+              conversation_id: null,
+              conversation_origin: null,
+              gizmo_id: null,
+              requested_default_model: requestModel,
+              system_hints: null,
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              timezone_offset_min: new Date().getTimezoneOffset(),
+            },
+          }),
+          "init",
+          10000,
+        );
         for (const item of init?.model_limits ?? []) {
           if (typeof item?.model_slug === "string") {
             recordReset(item.model_slug, item.resets_after);
@@ -909,17 +1134,21 @@ ${buildResolverJs(preferredExports)}
       let until = Date.now() + 3 * 60 * 1000;
       if (errorObject?.responseStatus === 429) {
         try {
-          const init = await client.safePost("/conversation/init", {
-            requestBody: {
-              conversation_id: null,
-              conversation_origin: null,
-              gizmo_id: null,
-              requested_default_model: requestModel,
-              system_hints: null,
-              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-              timezone_offset_min: new Date().getTimezoneOffset(),
-            },
-          });
+          const init = await withTimeout(
+            client.safePost("/conversation/init", {
+              requestBody: {
+                conversation_id: null,
+                conversation_origin: null,
+                gizmo_id: null,
+                requested_default_model: requestModel,
+                system_hints: null,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                timezone_offset_min: new Date().getTimezoneOffset(),
+              },
+            }),
+            "init",
+            10000,
+          );
           const send = (init?.blocked_features ?? []).find((feature) => feature?.name === "send");
           const resetsAt = Date.parse(send?.resets_after ?? "");
           if (Number.isFinite(resetsAt) && resetsAt > until) until = resetsAt;
@@ -936,7 +1165,7 @@ ${buildResolverJs(preferredExports)}
       };
     }
     const recoverable = outcome !== "complete" && errorCode === null;
-    if (!conversationId) {
+    if (handleRejected || !conversationId) {
       return {
         error: "串流沒有確認送出狀態",
         stage: "unknown_send_state",
@@ -1009,15 +1238,20 @@ ${buildResolverJs(preferredExports)}
     };
     const streamCandidates = [];
     for (const rawEv of events) {
-      let ev = rawEv;
-      if (typeof ev === "string") {
-        try { ev = JSON.parse(ev); } catch { ev = null; }
-      }
-      const msgCandidate =
-        ev?.data?.message ?? ev?.data?.v?.message ?? ev?.message ?? null;
-      if (msgCandidate) {
-        streamCandidates.push(msgCandidate);
-        considerMessage(msgCandidate, false);
+      for (const ev of parseJsonCandidates(rawEv)) {
+        const dataItems = ev?.data !== undefined ? parseJsonCandidates(ev.data) : [];
+        for (const evData of dataItems) {
+          const msgCandidate = evData?.message ?? evData?.v?.message ?? null;
+          if (msgCandidate) {
+            streamCandidates.push(msgCandidate);
+            considerMessage(msgCandidate, false);
+          }
+        }
+        const directMsg = ev?.message ?? ev?.v?.message ?? null;
+        if (directMsg) {
+          streamCandidates.push(directMsg);
+          considerMessage(directMsg, false);
+        }
       }
     }
     if (best === null) {
@@ -1025,17 +1259,17 @@ ${buildResolverJs(preferredExports)}
         considerMessage(msgCandidate, true);
       }
     }
-    // 對話已建立但串流斷掉時，用對話編號讀回背景寫完的答案，不白丟這則回答。
-    // 讀取額度整個帳號共用且很緊：2026-10-20 多筆並行撈答案時 GET 大半回 "Too many requests"，
-    // 被拒的讀取似乎也延長限流，連 ChatGPT.app 自己的側欄都讀不到。所以同一時間只讓一筆撈，
-    // 其餘直接放棄交給備援；讀取一被拒就停掉所有撈答案與送出 10 分鐘，讓額度恢復。
     let recoverReads = 0;
     const giveUp = (why, pauseMs, accountCooldown = pauseMs > 0) => {
-      if (pauseMs > 0) {
-        globalThis.__magpieReadBlockedUntil = Date.now() + pauseMs;
+      const safePauseMs = typeof pauseMs === "number" && Number.isFinite(pauseMs) && pauseMs > 0 ? pauseMs : 0;
+      if (safePauseMs > 0) {
+        globalThis.__magpieReadBlockedUntil = Date.now() + safePauseMs;
+        const prevUntil = typeof globalThis.__magpieUnusualActivityUntil === "number" && Number.isFinite(globalThis.__magpieUnusualActivityUntil)
+          ? globalThis.__magpieUnusualActivityUntil
+          : 0;
         globalThis.__magpieUnusualActivityUntil = Math.max(
-          globalThis.__magpieUnusualActivityUntil ?? 0,
-          Date.now() + pauseMs,
+          prevUntil,
+          Date.now() + safePauseMs,
         );
       }
       return {
@@ -1046,30 +1280,17 @@ ${buildResolverJs(preferredExports)}
         outcome,
         conversationId,
         recoverReads,
-        // Retry-After 太短時 Magpie 會在同一請求內對同一個 provider 立刻重送（2026-10-21 實測 1 秒→連送 4 次、
-        // 每次都是一則新生成），群組裡還會拖過 claude-mem 的 300 秒逾時；給 30 秒讓它改走下一個成員。
-        retryAfterMs: Math.max(pauseMs, 30000),
+        retryAfterMs: Math.max(safePauseMs, 30000),
       };
     };
     if (recoverable && best === null) {
       globalThis.__magpieSoftFlagAt = Date.now();
       if ((globalThis.__magpieReadBlockedUntil ?? 0) > Date.now()) return giveUp("讀取限流中", 0, true);
-      // 同時撈答案的上限與讀取被拒後的暫停長度可在 renderer 直接調，方便實驗不用重新部署。
-      // 預設 2：2026-10-21 模擬同時 2 筆 30 分鐘 44/45 成功、GET 0 次被拒；同時 3 筆 20 分鐘就撞到 24 小時上限。
       if ((globalThis.__magpieRecovering ?? 0) >= (globalThis.__magpieMaxRecovering ?? 2)) {
         return giveUp("撈答案名額已滿", 0, false);
       }
       globalThis.__magpieRecovering = (globalThis.__magpieRecovering ?? 0) + 1;
-      // 整段對話的 GET 額度很緊（2026-10-20 實測約 6 分半 23 次就被限流），但 App 自己續傳前用的
-      // stream_status 不算在內（2026-10-21 實測 5 分半連打 140 次都正常，之後 GET 也正常）。
-      // 所以先輪詢 stream_status，等它不再是 IS_STREAMING 才讀整段對話，每撈一筆通常只花一次 GET。
-      // 不能拿對話 update_time 判斷停住：thinking 寫正文期間它不會更新，曾把 197 秒寫完的回答在 184 秒誤判放棄。
       const statusGapMs = globalThis.__magpieStatusGapMs ?? 5000;
-      const withTimeout = (promise, label) => Promise.race([
-        promise,
-        // safeGet 沒有自己的逾時；卡住一次就會把整段撈答案拖到呼叫端逾時。
-        new Promise((_, reject) => setTimeout(() => reject(new Error(label + " timeout 20s")), 20000)),
-      ]);
       const startedAt = Date.now();
       const deadline = startedAt + (options.recoverWithinMs ?? 90000);
       const readLog = [];
@@ -1079,12 +1300,10 @@ ${buildResolverJs(preferredExports)}
       let statusErrors = 0;
       let lastStatus = null;
       let unreadable = false;
-      // 只有 HTTP 429 才算讀取限流、要全體暫停；2026-10-21 長回答被插「something seems to have gone wrong」後
-      // 讀對話回 404 conversation_inaccessible，被當成限流整個暫停 10 分鐘兩次，30 分鐘停擺 20 分鐘。
       const isThrottled = (error) => Number(error?.status ?? error?.responseStatus) === 429;
       try {
         while (best === null && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, Math.min(statusGapMs, deadline - Date.now())));
+          await new Promise((r) => setTimeout(r, Math.max(0, Math.min(statusGapMs, deadline - Date.now()))));
           const elapsed = Math.round((Date.now() - startedAt) / 1000);
           let status;
           try {
@@ -1096,7 +1315,7 @@ ${buildResolverJs(preferredExports)}
             statusErrors = 0;
           } catch (error) {
             statusErrors += 1;
-            readLog.push({ s: elapsed, statusThrown: String(error?.message ?? error).slice(0, 200), httpStatus: error?.status ?? null });
+            readLog.push({ s: elapsed, statusThrown: true, httpStatus: Number.isInteger(error?.status) ? error.status : null });
             if (isThrottled(error) && statusErrors >= 3) { readRejected = true; break; }
             if (statusErrors >= 3) break;
             continue;
@@ -1122,8 +1341,8 @@ ${buildResolverJs(preferredExports)}
                 "read",
               );
             } catch (error) {
-              entry.thrown = String(error?.message ?? error).slice(0, 200);
-              entry.httpStatus = error?.status ?? null;
+              entry.thrown = true;
+              entry.httpStatus = Number.isInteger(error?.status) ? error.status : null;
               readLog.push(entry);
               if (isThrottled(error)) readRejected = true;
               else unreadable = true;
@@ -1167,9 +1386,12 @@ ${buildResolverJs(preferredExports)}
       }
     }
     if (!recoverable && (outcome !== "complete" || best === null)) {
-      const conversation = await client.safeGet(
-        \`/conversation/\${encodeURIComponent(conversationId)}\`,
-        {},
+      const conversation = await withTimeout(
+        client.safeGet(
+          \`/conversation/\${encodeURIComponent(conversationId)}\`,
+          {},
+        ),
+        "read",
       );
       const mapping = conversation?.mapping ?? {};
       best = null;
@@ -1321,8 +1543,12 @@ const roleLabel = (role) => {
       return "Assistant";
     case "user":
       return "User";
-    default:
-      return String(role ?? "User");
+    default: {
+      const cleaned = String(role ?? "User")
+        .replace(/[\r\n\[\]\x00-\x1f\x7f]/g, "")
+        .trim();
+      return cleaned.length > 0 ? cleaned : "User";
+    }
   }
 };
 
@@ -1386,14 +1612,48 @@ export const formatMessagesToPrompt = (messagesOrPrompt) => {
   );
 };
 
+const decodeWsMessage = (event) => {
+  if (typeof event === "string") return event;
+  if (Buffer.isBuffer(event)) return event.toString("utf8");
+  if (event instanceof ArrayBuffer) return Buffer.from(event).toString("utf8");
+  if (ArrayBuffer.isView(event)) {
+    return Buffer.from(event.buffer, event.byteOffset, event.byteLength).toString("utf8");
+  }
+  const data = event?.data;
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+  }
+  return String(data ?? "");
+};
+
 const attachWsListener = (ws, event, handler) => {
   if (typeof ws.addEventListener === "function") {
     ws.addEventListener(event, handler);
-  } else if (typeof ws.on === "function") {
-    ws.on(event, handler);
-  } else {
-    ws[`on${event}`] = handler;
+    return () => {
+      if (typeof ws.removeEventListener === "function") {
+        ws.removeEventListener(event, handler);
+      }
+    };
   }
+  if (typeof ws.on === "function") {
+    ws.on(event, handler);
+    return () => {
+      if (typeof ws.off === "function") {
+        ws.off(event, handler);
+      } else if (typeof ws.removeListener === "function") {
+        ws.removeListener(event, handler);
+      }
+    };
+  }
+  ws[`on${event}`] = handler;
+  return () => {
+    if (ws[`on${event}`] === handler) {
+      ws[`on${event}`] = null;
+    }
+  };
 };
 
 const safeCloseWs = (ws) => {
@@ -1402,7 +1662,6 @@ const safeCloseWs = (ws) => {
       ws.close();
     }
   } catch {
-    // 關閉失敗不覆蓋原始錯誤。
   }
 };
 
@@ -1417,24 +1676,33 @@ export const evaluateInRenderer = ({
   new Promise((resolve, reject) => {
     let settled = false;
     let wsOpened = false;
+    let evalSent = false;
     let ws = null;
     let timer = null;
     let discoveryAttempted = false;
     let resolutionFailure = null;
     const loadedModuleUrls = new Set();
+    const detachListeners = [];
 
-    const sendEvaluation = (moduleUrls) => ws.send(JSON.stringify({
-      id: 1,
-      method: "Runtime.evaluate",
-      params: {
-        // 網址只供這次解析使用，不在 renderer 全域留下跨請求或跨版本的快取。
-        expression: moduleUrls
-          ? `((__magpieLoadedClientModuleUrls) => (${expression}))(${JSON.stringify(moduleUrls)})`
-          : expression,
-        returnByValue: true,
-        awaitPromise: true,
-      },
-    }));
+    const sendEvaluation = (moduleUrls) => {
+      evalSent = true;
+      try {
+        ws.send(JSON.stringify({
+          id: 1,
+          method: "Runtime.evaluate",
+          params: {
+            expression: moduleUrls
+              ? `((__magpieLoadedClientModuleUrls) => (${expression}))(${safeJsonForJs(moduleUrls)})`
+              : expression,
+            returnByValue: true,
+            awaitPromise: true,
+          },
+        }));
+      } catch (error) {
+        evalSent = false;
+        throw error;
+      }
+    };
 
     const cleanup = () => {
       if (timer !== null) {
@@ -1443,6 +1711,12 @@ export const evaluateInRenderer = ({
       }
       if (signal && typeof signal.removeEventListener === "function") {
         signal.removeEventListener("abort", onAbort);
+      }
+      for (const detach of detachListeners.splice(0)) {
+        try {
+          detach();
+        } catch {
+        }
       }
     };
 
@@ -1462,24 +1736,32 @@ export const evaluateInRenderer = ({
       resolve(value);
     };
 
+    const isUncertainSend = () => generation && evalSent;
+
     function onAbort() {
+      const uncertain = isUncertainSend();
       fail(
         new ChatGPTDesktopError("請求已取消", {
-          stage: generation ? "unknown_send_state" : "aborted",
-          retrySafe: !generation,
+          stage: uncertain ? "unknown_send_state" : "aborted",
+          retrySafe: !uncertain,
           status: 502,
           details: { aborted: true },
         }),
       );
     }
 
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+
     try {
       ws = new WebSocketImpl(wsUrl);
     } catch (error) {
       fail(
-        new ChatGPTDesktopError(`CDP 連線中斷：${error?.message ?? error}`, {
-          stage: generation ? "unknown_send_state" : "cdp_unreachable",
-          retrySafe: !generation,
+        new ChatGPTDesktopError(`CDP 連線中斷：${redactSecrets(error?.message ?? error)}`, {
+          stage: "cdp_unreachable",
+          retrySafe: true,
           status: 502,
           cause: error,
         }),
@@ -1487,218 +1769,224 @@ export const evaluateInRenderer = ({
       return;
     }
 
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
     if (signal && typeof signal.addEventListener === "function") {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
     timer = setTimeout(() => {
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      const uncertain = isUncertainSend();
       fail(
         new ChatGPTDesktopError(`renderer ${seconds} 秒內沒有回應`, {
-          stage: generation
+          stage: uncertain
             ? "unknown_send_state"
             : wsOpened
               ? "renderer_timeout"
               : "cdp_unreachable",
-          retrySafe: !generation,
+          retrySafe: !uncertain,
           status: 502,
           details: { timeoutMs, wsOpened },
         }),
       );
     }, timeoutMs);
 
-    attachWsListener(ws, "open", () => {
-      if (settled) return;
-      wsOpened = true;
-      try {
-        sendEvaluation();
-      } catch (error) {
-        fail(
-          new ChatGPTDesktopError(`CDP 連線中斷：${error?.message ?? error}`, {
-            stage: generation ? "unknown_send_state" : "cdp_unreachable",
-            retrySafe: !generation,
-            status: 502,
-            cause: error,
-          }),
-        );
-      }
-    });
-
-    attachWsListener(ws, "message", (event) => {
-      if (settled) return;
-      const raw =
-        typeof event === "string" || Buffer.isBuffer(event)
-          ? String(event)
-          : String(event?.data ?? "");
-      let message;
-      try {
-        message = JSON.parse(raw);
-      } catch (error) {
-        fail(
-          new ChatGPTDesktopError(
-            `無法確認 renderer 回應：${error?.message ?? error}`,
-            {
-              stage: generation ? "unknown_send_state" : "cdp_unreachable",
-              retrySafe: !generation,
+    detachListeners.push(
+      attachWsListener(ws, "open", () => {
+        if (settled) return;
+        wsOpened = true;
+        try {
+          sendEvaluation();
+        } catch (error) {
+          fail(
+            new ChatGPTDesktopError(`CDP 連線中斷：${redactSecrets(error?.message ?? error)}`, {
+              stage: isUncertainSend() ? "unknown_send_state" : "cdp_unreachable",
+              retrySafe: !isUncertainSend(),
               status: 502,
               cause: error,
-            },
-          ),
-        );
-        return;
-      }
-
-      if (resolutionFailure && message?.method === "Debugger.scriptParsed") {
-        const url = message.params?.url;
-        if (typeof url === "string" && /^app:\/\/-\/assets\/(?:app-(?:shared|initial)-[\w-]+|\d+\.[\w-]+)\.js(?:\?[^#]*)?$/.test(url)) {
-          loadedModuleUrls.add(url);
+            }),
+          );
         }
-        return;
-      }
+      }),
+    );
 
-      if (resolutionFailure && (message?.id === 2 || message?.id === 3)) {
+    detachListeners.push(
+      attachWsListener(ws, "message", (event) => {
+        if (settled) return;
+        const raw = decodeWsMessage(event);
+        let message;
         try {
-          if (message.id === 2 && !message.error) {
-            ws.send(JSON.stringify({ id: 3, method: "Debugger.disable", params: {} }));
-            return;
-          }
-          if (message.id === 3 && !message.error && loadedModuleUrls.size > 0) {
-            sendEvaluation([...loadedModuleUrls]);
-            resolutionFailure = null;
-            return;
-          }
-        } catch {
-          // 除錯能力不可用時保留原解析錯誤，不能因此重送未知狀態的請求。
-        }
-        message = { id: 1, result: { result: { value: resolutionFailure } } };
-        resolutionFailure = null;
-      }
-
-      if (message?.id !== 1) return;
-
-      if (message.error) {
-        fail(
-          new ChatGPTDesktopError(message.error.message ?? "CDP 回報錯誤", {
-            stage: generation ? "unknown_send_state" : "cdp_unreachable",
-            retrySafe: !generation,
-            status: 502,
-          }),
-        );
-        return;
-      }
-
-      const evalResult = message.result ?? {};
-      if (evalResult.exceptionDetails) {
-        fail(
-          new ChatGPTDesktopError(
-            evalResult.exceptionDetails.text ?? "renderer 執行失敗",
-            {
-              stage: generation ? "unknown_send_state" : "cdp_unreachable",
-              retrySafe: !generation,
-              status: 502,
-            },
-          ),
-        );
-        return;
-      }
-
-      const value = evalResult.result?.value;
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        fail(
-          new ChatGPTDesktopError("renderer 回傳了非預期的結果", {
-            stage: generation ? "unknown_send_state" : "cdp_unreachable",
-            retrySafe: !generation,
-            status: 502,
-          }),
-        );
-        return;
-      }
-
-      // 新版 app 隱藏資源計時且禁止 fetch app:// 資產；CDP 仍能列出已載入的模組。
-      // 只補查一次送出前的解析失敗；認證拒絕與送出後的錯誤一律維持原處理。
-      if (!discoveryAttempted
-        && value.error != null
-        && ["module_not_found", "client_not_found"].includes(value.stage)
-        && value.retrySafe !== false
-        && (!generation || value.retrySafe === true)) {
-        discoveryAttempted = true;
-        resolutionFailure = value;
-        try {
-          ws.send(JSON.stringify({ id: 2, method: "Debugger.enable", params: {} }));
+          message = JSON.parse(raw);
+        } catch (error) {
+          const uncertain = isUncertainSend();
+          fail(
+            new ChatGPTDesktopError(
+              `無法確認 renderer 回應：${redactSecrets(error?.message ?? error)}`,
+              {
+                stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+                retrySafe: !uncertain,
+                status: 502,
+                cause: error,
+              },
+            ),
+          );
           return;
-        } catch {
+        }
+
+        if (resolutionFailure && message?.method === "Debugger.scriptParsed") {
+          const url = message.params?.url;
+          if (typeof url === "string" && /^app:\/\/-\/assets\/(?:app-(?:shared|initial)-[\w-]+|\d+\.[\w-]+)\.js(?:\?[^#]*)?$/.test(url)) {
+            loadedModuleUrls.add(url);
+          }
+          return;
+        }
+
+        if (resolutionFailure && (message?.id === 2 || message?.id === 3)) {
+          try {
+            if (message.id === 2 && !message.error) {
+              ws.send(JSON.stringify({ id: 3, method: "Debugger.disable", params: {} }));
+              return;
+            }
+            if (message.id === 3 && !message.error && loadedModuleUrls.size > 0) {
+              sendEvaluation([...loadedModuleUrls]);
+              resolutionFailure = null;
+              return;
+            }
+          } catch {
+          }
+          message = { id: 1, result: { result: { value: resolutionFailure } } };
           resolutionFailure = null;
         }
-      }
 
-      if (
-        (value.error !== undefined && value.error !== null) ||
-        value.retrySafe === false ||
-        value.stage === "unknown_send_state" ||
-        (generation &&
-          (typeof value.answer !== "string" || value.answer.trim().length === 0))
-      ) {
-        const retrySafe = generation
-          ? value.retrySafe === true
-          : value.retrySafe !== false;
-        const stage =
-          value.stage ??
-          (value.quotaRejected
-            ? "quota_exceeded"
-            : retrySafe
-              ? "client_not_found"
-              : "unknown_send_state");
-        const status =
-          value.quotaRejected || stage === "rate_limited"
-            ? 429
-            : stage === "context_length_exceeded"
-              ? 413
-              : 502;
-        const rawErr =
-          typeof value.error === "string" ? value.error.trim() : "";
+        if (message?.id !== 1) return;
+
+        if (message.error) {
+          const uncertain = isUncertainSend();
+          fail(
+            new ChatGPTDesktopError(redactSecrets(message.error.message ?? "CDP 回報錯誤"), {
+              stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+              retrySafe: !uncertain,
+              status: 502,
+            }),
+          );
+          return;
+        }
+
+        const evalResult = message.result ?? {};
+        if (evalResult.exceptionDetails) {
+          const uncertain = isUncertainSend();
+          fail(
+            new ChatGPTDesktopError(
+              redactSecrets(evalResult.exceptionDetails.text ?? "renderer 執行失敗"),
+              {
+                stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+                retrySafe: !uncertain,
+                status: 502,
+              },
+            ),
+          );
+          return;
+        }
+
+        const value = evalResult.result?.value;
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          const uncertain = isUncertainSend();
+          fail(
+            new ChatGPTDesktopError("renderer 回傳了非預期的結果", {
+              stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+              retrySafe: !uncertain,
+              status: 502,
+            }),
+          );
+          return;
+        }
+
+        if (!discoveryAttempted
+          && value.error != null
+          && ["module_not_found", "client_not_found"].includes(value.stage)
+          && value.retrySafe !== false
+          && (!generation || value.retrySafe === true)) {
+          discoveryAttempted = true;
+          resolutionFailure = value;
+          evalSent = false;
+          try {
+            ws.send(JSON.stringify({ id: 2, method: "Debugger.enable", params: {} }));
+            return;
+          } catch {
+            resolutionFailure = null;
+          }
+        }
+
+        if (
+          (value.error !== undefined && value.error !== null) ||
+          value.retrySafe === false ||
+          value.stage === "unknown_send_state" ||
+          (generation &&
+            (typeof value.answer !== "string" || value.answer.trim().length === 0))
+        ) {
+          const retrySafe = generation
+            ? value.retrySafe === true
+            : value.retrySafe !== false;
+          const stage =
+            value.stage ??
+            (value.quotaRejected
+              ? "quota_exceeded"
+              : retrySafe
+                ? "client_not_found"
+                : "unknown_send_state");
+          const status =
+            value.quotaRejected || stage === "rate_limited"
+              ? 429
+              : stage === "context_length_exceeded"
+                ? 413
+                : 502;
+          const rawErr =
+            typeof value.error === "string" ? redactSecrets(value.error.trim()) : "";
+          fail(
+            new ChatGPTDesktopError(
+              rawErr.length > 0 ? rawErr : "renderer 執行失敗",
+              {
+                stage,
+                retrySafe,
+                status,
+                details: value,
+              },
+            ),
+          );
+          return;
+        }
+
+        succeed(value);
+      }),
+    );
+
+    detachListeners.push(
+      attachWsListener(ws, "error", (event) => {
+        if (settled) return;
+        const reason = redactSecrets(event?.message ?? event?.error?.message ?? "socket error");
+        const uncertain = isUncertainSend();
         fail(
-          new ChatGPTDesktopError(
-            rawErr.length > 0 ? rawErr : "renderer 執行失敗",
-            {
-              stage,
-              retrySafe,
-              status,
-              details: value,
-            },
-          ),
+          new ChatGPTDesktopError(`CDP 連線中斷：${reason}`, {
+            stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+            retrySafe: !uncertain,
+            status: 502,
+          }),
         );
-        return;
-      }
+      }),
+    );
 
-      succeed(value);
-    });
-
-    attachWsListener(ws, "error", (event) => {
-      if (settled) return;
-      const reason = event?.message ?? event?.error?.message ?? "socket error";
-      fail(
-        new ChatGPTDesktopError(`CDP 連線中斷：${reason}`, {
-          stage: generation ? "unknown_send_state" : "cdp_unreachable",
-          retrySafe: !generation,
-          status: 502,
-        }),
-      );
-    });
-
-    attachWsListener(ws, "close", () => {
-      if (settled) return;
-      fail(
-        new ChatGPTDesktopError("CDP 連線中斷：WebSocket 已關閉", {
-          stage: generation ? "unknown_send_state" : "cdp_unreachable",
-          retrySafe: !generation,
-          status: 502,
-        }),
-      );
-    });
+    detachListeners.push(
+      attachWsListener(ws, "close", () => {
+        if (settled) return;
+        const uncertain = isUncertainSend();
+        fail(
+          new ChatGPTDesktopError("CDP 連線中斷：WebSocket 已關閉", {
+            stage: uncertain ? "unknown_send_state" : "cdp_unreachable",
+            retrySafe: !uncertain,
+            status: 502,
+          }),
+        );
+      }),
+    );
   });
 
 export const normalizeCatalogModels = (catalog) => {
@@ -1768,6 +2056,7 @@ export const probeClient = async ({
       cdpUrl: resolvedCdp.cdpUrl,
       fetchImpl,
       timeoutMs: targetTimeoutMs,
+      signal,
     });
     const result = await evaluateInRenderer({
       wsUrl: target.webSocketDebuggerUrl,
@@ -1829,6 +2118,7 @@ export const listModels = async ({
       cdpUrl: resolvedCdp.cdpUrl,
       fetchImpl,
       timeoutMs: targetTimeoutMs,
+      signal,
     });
     const result = await evaluateInRenderer({
       wsUrl: target.webSocketDebuggerUrl,
@@ -1919,6 +2209,7 @@ export const sendConversation = async ({
       cdpUrl: resolvedCdp.cdpUrl,
       fetchImpl,
       timeoutMs: targetTimeoutMs,
+      signal,
     });
     const expression = buildChatExpression(
       {
@@ -1950,7 +2241,12 @@ export const sendConversation = async ({
   } catch (error) {
     // 只有真正全帳號限流（被拒收或讀取 429）才記進程序冷卻；單筆卡住、讀不到或自家每日預算不冷凍整個帳號。
     if (error?.stage === "rate_limited" && error?.details?.accountCooldown === true) {
-      unusualActivityUntil = Date.now() + (error?.details?.retryAfterMs ?? UNUSUAL_ACTIVITY_COOLDOWN_MS);
+      const rawRetry = error?.details?.retryAfterMs;
+      const cooldownMs =
+        typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry > 0
+          ? rawRetry
+          : UNUSUAL_ACTIVITY_COOLDOWN_MS;
+      unusualActivityUntil = Date.now() + cooldownMs;
     }
     const details = error?.details ?? {};
     const eligibleModel = allowProFallback

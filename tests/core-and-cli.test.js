@@ -290,6 +290,18 @@ const startMockCdpServer = async (scenario = {}) => {
             `      const body = JSON.parse(init.body);`,
             `      globalThis.__testRequests.push(body);`,
             `      const quota = { detail: { code: "model_cap_exceeded", message: "Allowance exhausted" } };`,
+            `      if (scenario.kind === "async-stream-failure") {`,
+            `        if (scenario.resumeToken) {`,
+            `          init.onStreamData(`,
+            `            "data: " + JSON.stringify({ conversation_id: "conv-stream-failure" }) + "\\n\\n" +`,
+            `            "data: " + JSON.stringify({ type: "resume_conversation_token", token: scenario.resumeToken }) + "\\n\\n",`,
+            `          );`,
+            `        }`,
+            `        const error = Object.assign(new Error("fixture stream failed"), { code: "model_cap_exceeded" });`,
+            `        const failed = Promise.reject(error);`,
+            `        failed.catch(() => {});`,
+            `        return failed;`,
+            `      }`,
             `      if (scenario.kind === "stream-complete") {`,
             `        init.onEvent({`,
             `          type: "fetch-stream-event",`,
@@ -428,6 +440,7 @@ const startMockCdpServer = async (scenario = {}) => {
           querySelectorAll: () => pageNodes,
         };
 
+        const previousResume = globalThis.__magpieLastResume;
         let evalResult;
         try {
           const AsyncFunction = Object.getPrototypeOf(
@@ -435,12 +448,20 @@ const startMockCdpServer = async (scenario = {}) => {
           ).constructor;
           const fn = new AsyncFunction(`return await ${expression};`);
           const result = await fn();
+          if (scenario.kind === "async-stream-failure") {
+            state.diagnostics = globalThis.__magpieStreamDiag?.at(-1);
+            state.storedResumeCredential = globalThis.__magpieLastResume !== previousResume;
+          }
           evalResult = { result, requests, reads };
         } finally {
           globalThis.performance = prevPerformance;
           globalThis.document = prevDocument;
           delete globalThis.__testRequests;
           delete globalThis.__testReads;
+          if (scenario.kind === "async-stream-failure" && state.storedResumeCredential) {
+            if (previousResume === undefined) delete globalThis.__magpieLastResume;
+            else globalThis.__magpieLastResume = previousResume;
+          }
         }
         state.requests.push(...evalResult.requests);
         state.reads.push(...evalResult.reads);
@@ -1355,6 +1376,46 @@ describe("Ticket 01 — 自動降級 Instant 開關（涵蓋 Pro 與 Thinking）
 });
 
 describe("Ticket 01 — 逾時、斷線、無完成訊息與 AbortSignal 取消時立即關閉 WebSocket 且不重送", () => {
+  test("an asynchronously rejected stream reaches the existing failure path without retrying", async () => {
+    const mock = await startMockCdpServer({ kind: "async-stream-failure" });
+    try {
+      await expect(sendConversation({
+        cdpUrl: mock.cdpUrl, model: THINKING_MODEL, prompt: "fixture prompt", timeoutMs: 500, instantFallback: true,
+      })).rejects.toMatchObject({
+        stage: "unknown_send_state", retrySafe: false, details: { outcome: "error" },
+      });
+      expect(mock.state.requests).toHaveLength(1);
+      await mock.waitForWsClose(1);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("renderer stream diagnostics keep structure without upstream error text or resume credentials", async () => {
+    const resumeToken = "fixture-resume-credential";
+    const mock = await startMockCdpServer({ kind: "async-stream-failure", resumeToken });
+    try {
+      await expect(sendConversation({
+        cdpUrl: mock.cdpUrl, model: THINKING_MODEL, prompt: "fixture prompt", timeoutMs: 500,
+      })).rejects.toMatchObject({
+        stage: "unknown_send_state", retrySafe: false, details: { outcome: "error" },
+      });
+      expect(mock.state.diagnostics).toMatchObject({
+        outcome: "error",
+        conversationId: "conv-stream-failure",
+        eventCount: 2,
+        eventShapes: ["string", "object"],
+        hasResumeToken: true,
+      });
+      const diagnostics = JSON.stringify(mock.state.diagnostics);
+      expect(diagnostics).not.toContain("fixture stream failed");
+      expect(diagnostics).not.toContain(resumeToken);
+      expect(mock.state.storedResumeCredential).toBe(false);
+    } finally {
+      mock.stop();
+    }
+  });
+
   test("呼叫端觸發 AbortSignal 時立即關閉 WebSocket 並標記為 unknown_send_state (retrySafe: false)", async () => {
     const mock = await startMockCdpServer({ hangForever: true });
     try {

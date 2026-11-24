@@ -6,7 +6,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ChatGPTDesktopError, estimateTokenCount, formatMessagesToPrompt, normalizeThinkingEffort } from "./core.js";
+import {
+  ChatGPTDesktopError,
+  createSerialQueue,
+  decodeBodyToString,
+  estimateTokenCount,
+  formatMessagesToPrompt,
+  normalizeThinkingEffort,
+  redactSecrets,
+  safeJsonForJs,
+} from "./core.js";
 
 export const WEB_DEFAULT_PORT = 19444;
 // Magpie 的 plugin 宿主把 HOME 改到 ~/.magpie-machine/home，os.homedir() 會指錯；Bun 的
@@ -23,13 +32,15 @@ const WEB_MODELS = [
 // 網頁版只能從畫面送出（送出前要 sentinel 運算量證明與 Turnstile，由頁面自己產生）；
 // 畫面上只打一個佔位字元，再在網路層換成真正的 prompt、模型與思考強度，免得把長文打進輸入框。
 export const rewriteConversationBody = (body, { prompt, model, effort }) => {
-  // 不能只靠 ?temporary-chat=true：2026-10-21 公司帳號側邊欄出現背景請求留下的一般對話，頁面送出的內容並不一定帶暫時旗標。
-  const out = { ...body, model: model ?? body.model, history_and_training_disabled: true, is_do_not_remember: true };
-  out.messages = (body.messages ?? []).map((message, index) =>
-    index === 0 ? { ...message, content: { ...message.content, content_type: "text", parts: [prompt] } } : message);
+  const safeBody = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const outModel = model ?? safeBody.model;
+  const out = { ...safeBody, model: outModel, history_and_training_disabled: true, is_do_not_remember: true };
+  const rawMessages = Array.isArray(safeBody.messages) ? safeBody.messages : [];
+  out.messages = rawMessages.map((message, index) =>
+    index === 0 ? { ...message, content: { ...message?.content, content_type: "text", parts: [prompt] } } : message);
   delete out.thinking_effort;
   const normalized = normalizeThinkingEffort(effort, out.model);
-  if (normalized && /thinking|-pro$/.test(out.model)) out.thinking_effort = normalized;
+  if (normalized && typeof out.model === "string" && /thinking|-pro$/.test(out.model)) out.thinking_effort = normalized;
   return out;
 };
 
@@ -59,18 +70,87 @@ export const extractFinalAnswer = (conversation) => {
   };
 };
 
-// 每日預算記在檔案：Magpie 重載 plugin 不會歸零，也不必依賴頁面的 localStorage。
 export const checkDailyBudget = (sends, budget, now = Date.now()) => {
-  const recent = sends.filter((at) => typeof at === "number" && now - at < DAY_MS);
-  if (typeof budget !== "number" || recent.length < budget) return { ok: true, recent };
-  return { ok: false, recent, retryAfterMs: Math.max(60000, recent[recent.length - budget] + DAY_MS - now) };
+  const list = Array.isArray(sends) ? sends : [];
+  const recent = list
+    .filter((at) => typeof at === "number" && Number.isFinite(at) && now - at < DAY_MS)
+    .sort((a, b) => a - b);
+  if (typeof budget !== "number" || !Number.isFinite(budget) || recent.length < budget) {
+    return { ok: true, recent };
+  }
+  const oldest = budget > 0 ? recent[recent.length - budget] : undefined;
+  const retryAfterMs =
+    typeof oldest === "number" && Number.isFinite(oldest)
+      ? Math.max(60000, oldest + DAY_MS - now)
+      : DAY_MS;
+  return { ok: false, recent, retryAfterMs };
 };
 
 const readSends = (file) => {
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return []; }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 };
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const writeSendsAtomic = (file, sends) => {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpFile = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tmpFile, JSON.stringify(sends), { mode: 0o600 });
+    fs.renameSync(tmpFile, file);
+  } catch (error) {
+    try {
+      if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+    } catch {
+    }
+    throw error;
+  }
+};
+
+const safeParseJson = (text) => {
+  if (typeof text !== "string") return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+};
+
+const decodeWsData = (data) => {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+  }
+  return String(data ?? "");
+};
+
+const sleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted || ms <= 0) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal && typeof signal.removeEventListener === "function") {
+        signal.removeEventListener("abort", finish);
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", finish, { once: true });
+    }
+  });
 
 const rateLimited = (message, retryAfterMs) => new ChatGPTDesktopError(message, {
   stage: "rate_limited", retrySafe: true, status: 429, details: { retryAfterMs },
@@ -80,47 +160,202 @@ const unavailable = (message, stage, retryAfterMs = 60000) => new ChatGPTDesktop
   stage, retrySafe: true, status: 503, details: { retryAfterMs },
 });
 
-const browserVersion = async (cdpUrl) => {
-  const response = await fetch(`${cdpUrl}/json/version`, { signal: AbortSignal.timeout(3000) });
-  return response.json();
+const browserVersion = async (cdpUrl, signal) => {
+  if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  const onAbort = () => controller.abort();
+  if (signal && typeof signal.addEventListener === "function") {
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const response = await fetch(`${cdpUrl}/json/version`, { signal: controller.signal });
+    if (!response.ok) {
+      throw unavailable(`公司網頁版 Chrome 回應異常（HTTP ${response.status}）`, "cdp_unreachable");
+    }
+    const data = safeParseJson(await response.text());
+    if (typeof data?.webSocketDebuggerUrl !== "string" || !data.webSocketDebuggerUrl) {
+      throw unavailable("公司網頁版 Chrome 缺少 webSocketDebuggerUrl", "cdp_unreachable");
+    }
+    return data;
+  } catch (error) {
+    if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (signal && typeof signal.removeEventListener === "function") {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
 };
 
-// Chrome 沒開就用啟動腳本開（放螢幕外、不節流）；不在背景常駐，用到才開。
-const ensureBrowser = async ({ cdpUrl, launcher }) => {
-  try { return await browserVersion(cdpUrl); } catch {}
+const ensureBrowser = async ({ cdpUrl, launcher, signal }) => {
+  if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+  try {
+    return await browserVersion(cdpUrl, signal);
+  } catch (error) {
+    if (signal?.aborted || error?.stage === "aborted") throw unavailable("請求已取消", "aborted");
+  }
   if (!launcher || !fs.existsSync(launcher)) {
     throw unavailable("公司網頁版 Chrome 沒開，也找不到啟動腳本（CDP unreachable）", "cdp_unreachable");
   }
-  // Chrome 靠 $HOME 找登入鑰匙圈解 cookie；用宿主改過的 HOME 啟動會解不開、整個設定檔等於被登出
-  // （2026-10-21 實際把公司帳號登入弄丟過一次）。啟動腳本也會自己改回，這裡再保一層。
   spawn(launcher, [], { detached: true, stdio: "ignore", env: { ...process.env, HOME: REAL_HOME } }).unref();
   for (let i = 0; i < 20; i++) {
-    await sleep(1000);
-    try { return await browserVersion(cdpUrl); } catch {}
+    if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+    await sleep(1000, signal);
+    if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+    try {
+      return await browserVersion(cdpUrl, signal);
+    } catch (error) {
+      if (signal?.aborted || error?.stage === "aborted") throw unavailable("請求已取消", "aborted");
+    }
   }
   throw unavailable("公司網頁版 Chrome 啟動後 20 秒仍連不上（CDP unreachable）", "cdp_unreachable");
 };
 
-const openSession = async (wsUrl) => {
-  const ws = new WebSocket(wsUrl);
+const openSession = async (wsUrl, { handshakeTimeoutMs = 10000, commandTimeoutMs = 30000, signal } = {}) => {
+  if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch {
+    throw unavailable("連不上公司網頁版 Chrome（CDP websocket）", "cdp_unreachable");
+  }
   await new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve, { once: true });
-    ws.addEventListener("error", () => reject(unavailable("連不上公司網頁版 Chrome（CDP websocket）", "cdp_unreachable")), { once: true });
+    let settled = false;
+    const cleanupHandshake = () => {
+      clearTimeout(timer);
+      ws.removeEventListener("open", onOpen);
+      ws.removeEventListener("error", onError);
+      ws.removeEventListener("close", onClose);
+      if (signal && typeof signal.removeEventListener === "function") {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
+    const onOpen = () => {
+      if (settled) return;
+      settled = true;
+      cleanupHandshake();
+      resolve();
+    };
+    const failHandshake = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanupHandshake();
+      try { ws.close(); } catch {}
+      reject(err);
+    };
+    const onError = () => failHandshake(unavailable("連不上公司網頁版 Chrome（CDP websocket）", "cdp_unreachable"));
+    const onClose = () => failHandshake(unavailable("公司網頁版 Chrome CDP 連線提早關閉", "cdp_unreachable"));
+    const onAbort = () => failHandshake(unavailable("請求已取消", "aborted"));
+    const timer = setTimeout(() => failHandshake(unavailable("公司網頁版 Chrome CDP 連線逾時", "cdp_unreachable")), handshakeTimeoutMs);
+    ws.addEventListener("open", onOpen);
+    ws.addEventListener("error", onError);
+    ws.addEventListener("close", onClose);
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
   let nextId = 0;
+  let closed = false;
   const waiters = new Map();
   const listeners = new Set();
-  ws.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (waiters.has(message.id)) { waiters.get(message.id)(message); waiters.delete(message.id); }
-    else for (const listener of listeners) listener(message);
-  });
-  const send = (method, params = {}, sessionId) => new Promise((resolve) => {
+
+  const rejectAllWaiters = (err) => {
+    closed = true;
+    for (const waiter of waiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(err);
+    }
+    waiters.clear();
+  };
+
+  const rejectAbortableWaiters = () => {
+    const err = unavailable("請求已取消", "aborted");
+    for (const [id, waiter] of [...waiters.entries()]) {
+      if (waiter.bypassAbort) continue;
+      clearTimeout(waiter.timer);
+      waiters.delete(id);
+      waiter.reject(err);
+    }
+  };
+
+  const onMessage = (event) => {
+    let message;
+    try {
+      message = JSON.parse(decodeWsData(event?.data));
+    } catch {
+      rejectAllWaiters(unavailable("公司網頁版 Chrome 回傳損毀的 CDP 訊息", "cdp_unreachable"));
+      try { ws.close(); } catch {}
+      return;
+    }
+    if (!message || typeof message !== "object") return;
+    if (waiters.has(message.id)) {
+      const waiter = waiters.get(message.id);
+      waiters.delete(message.id);
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+    } else {
+      for (const listener of [...listeners]) {
+        Promise.resolve()
+          .then(() => listener(message))
+          .catch(() => {});
+      }
+    }
+  };
+  const onError = () => {
+    rejectAllWaiters(unavailable("公司網頁版 Chrome CDP 連線中斷", "cdp_unreachable"));
+  };
+  const onClose = () => {
+    rejectAllWaiters(unavailable("公司網頁版 Chrome CDP 連線已關閉", "cdp_unreachable"));
+  };
+  const onPostAbort = () => {
+    rejectAbortableWaiters();
+  };
+  ws.addEventListener("message", onMessage);
+  ws.addEventListener("error", onError);
+  ws.addEventListener("close", onClose);
+  if (signal && typeof signal.addEventListener === "function") {
+    signal.addEventListener("abort", onPostAbort, { once: true });
+  }
+
+  const send = (method, params = {}, sessionId, timeoutMs = commandTimeoutMs, { bypassAbort = false } = {}) => new Promise((resolve, reject) => {
+    if (closed) {
+      reject(unavailable("公司網頁版 Chrome CDP 連線已關閉", "cdp_unreachable"));
+      return;
+    }
+    if (!bypassAbort && signal?.aborted) {
+      reject(unavailable("請求已取消", "aborted"));
+      return;
+    }
     const id = ++nextId;
-    waiters.set(id, resolve);
-    ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    const timer = setTimeout(() => {
+      waiters.delete(id);
+      reject(unavailable("公司網頁版頁面回應逾時", "renderer_timeout"));
+    }, timeoutMs);
+    waiters.set(id, { resolve, reject, timer, bypassAbort });
+    try {
+      ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    } catch {
+      clearTimeout(timer);
+      waiters.delete(id);
+      reject(unavailable("公司網頁版 Chrome CDP 傳送失敗", "cdp_unreachable"));
+    }
   });
-  return { send, listeners, close: () => ws.close() };
+
+  const close = () => {
+    if (signal && typeof signal.removeEventListener === "function") {
+      signal.removeEventListener("abort", onPostAbort);
+    }
+    rejectAllWaiters(unavailable("公司網頁版 Chrome CDP 連線已關閉", "cdp_unreachable"));
+    listeners.clear();
+    ws.removeEventListener("message", onMessage);
+    ws.removeEventListener("error", onError);
+    ws.removeEventListener("close", onClose);
+    try { ws.close(); } catch {}
+  };
+
+  return { send, listeners, close };
 };
 
 export const sendWebConversation = async ({
@@ -131,38 +366,52 @@ export const sendWebConversation = async ({
   model = "gpt-6-thinking",
   effort,
   timeoutMs = 420000,
-  // 預設不設上限（使用者 2026-10-21 要先觀察真實用量）；sends.json 照常記錄，要恢復上限就傳數字。
   dailyBudget = null,
   budgetFile = path.join(WEB_HOME, "sends.json"),
   signal,
 }) => {
+  if (signal?.aborted) throw unavailable("請求已取消", "aborted");
   const budget = checkDailyBudget(readSends(budgetFile), dailyBudget);
   if (!budget.ok) throw rateLimited(`公司網頁版已用完 24 小時預算（${budget.recent.length}/${dailyBudget}）`, budget.retryAfterMs);
 
-  const version = await ensureBrowser({ cdpUrl, launcher });
-  const cdp = await openSession(version.webSocketDebuggerUrl);
+  const version = await ensureBrowser({ cdpUrl, launcher, signal });
+  const cdp = await openSession(version.webSocketDebuggerUrl, { signal });
   const started = Date.now();
   let targetId = null;
   let sendAttempted = false;
   let postStatus = null;
   try {
-    // 每筆在常駐視窗裡開背景分頁：沒有任何視窗時 Chrome 會為分頁新開視窗、送完關掉，畫面一直閃；
-    // 所以先留一個常駐視窗讓使用者自己縮到最小（加了不節流參數，背景分頁與最小化都照常渲染，2026-10-21 實測）。
     const pages = ((await cdp.send("Target.getTargets")).result?.targetInfos ?? []).filter((t) => t.type === "page");
     if (pages.length === 0) await cdp.send("Target.createTarget", { url: "about:blank", newWindow: true });
     targetId = (await cdp.send("Target.createTarget", {
       url: "https://chatgpt.com/?temporary-chat=true", background: true,
     })).result?.targetId;
     if (!targetId) throw unavailable("公司網頁版開不了分頁", "cdp_unreachable");
-    const sessionId = (await cdp.send("Target.attachToTarget", { targetId, flatten: true })).result.sessionId;
-    // 頁面卡住（例如沒登入的新設定檔停在 Cloudflare 驗證頁）時不能無限等：2026-10-21 一筆因此卡滿 4 分鐘。
+    const attachReply = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    const sessionId = attachReply?.result?.sessionId;
+    if (!sessionId || attachReply?.error) {
+      throw unavailable("公司網頁版無法附加至分頁", "cdp_unreachable");
+    }
     const evaluate = async (expression) => {
-      const reply = await Promise.race([
-        cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId),
-        sleep(30000).then(() => { throw unavailable("公司網頁版頁面 30 秒沒回應", "renderer_timeout"); }),
-      ]);
-      if (reply.result?.exceptionDetails) throw unavailable("公司網頁版頁面執行失敗：" + String(reply.result.exceptionDetails.exception?.description ?? "").slice(0, 200), "renderer_timeout");
-      return reply.result?.result?.value;
+      const reply = await cdp.send(
+        "Runtime.evaluate",
+        { expression, awaitPromise: true, returnByValue: true },
+        sessionId,
+        30000,
+      );
+      if (reply?.error) {
+        throw unavailable(
+          "公司網頁版頁面執行失敗：" + redactSecrets(reply.error.message ?? "").slice(0, 200),
+          "renderer_timeout",
+        );
+      }
+      if (reply?.result?.exceptionDetails) {
+        throw unavailable(
+          "公司網頁版頁面執行失敗：" + redactSecrets(reply.result.exceptionDetails.exception?.description ?? "").slice(0, 200),
+          "renderer_timeout",
+        );
+      }
+      return reply?.result?.result?.value;
     };
 
     let conversationId = null;
@@ -171,39 +420,64 @@ export const sendWebConversation = async ({
       if (message.sessionId !== sessionId) return;
       const params = message.params ?? {};
       if (message.method === "Fetch.requestPaused") {
-        const url = params.request.url;
-        if (/\/backend-api\/f\/conversation$/.test(url) && params.request.postData && !rewritten) {
-          rewritten = true;
-          const body = rewriteConversationBody(JSON.parse(params.request.postData), { prompt, model, effort });
-          sendAttempted = true;
-          await cdp.send("Fetch.continueRequest", { requestId: params.requestId, postData: Buffer.from(JSON.stringify(body)).toString("base64") }, sessionId);
-        } else {
-          await cdp.send("Fetch.continueRequest", { requestId: params.requestId }, sessionId);
+        if (signal?.aborted) {
+          await cdp.send(
+            "Fetch.failRequest",
+            { requestId: params.requestId, errorReason: "Aborted" },
+            sessionId,
+            1500,
+            { bypassAbort: true },
+          ).catch(() => {});
+          return;
         }
+        const url = String(params.request?.url ?? "");
+        if (/\/backend-api\/f\/conversation$/.test(url) && params.request?.postData && !rewritten) {
+          const parsedBody = safeParseJson(params.request.postData);
+          if (parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)) {
+            rewritten = true;
+            const body = rewriteConversationBody(parsedBody, { prompt, model, effort });
+            sendAttempted = true;
+            await cdp.send(
+              "Fetch.continueRequest",
+              { requestId: params.requestId, postData: Buffer.from(JSON.stringify(body)).toString("base64") },
+              sessionId,
+            ).catch(() => {});
+            return;
+          }
+        }
+        await cdp.send("Fetch.continueRequest", { requestId: params.requestId }, sessionId).catch(() => {});
       }
-      if (message.method === "Network.requestWillBeSent" && /\/backend-api\//.test(params.request.url)) {
-        const match = params.request.url.match(/\/conversation\/([0-9a-f-]{36})/)
+      if (message.method === "Network.requestWillBeSent" && /\/backend-api\//.test(String(params.request?.url ?? ""))) {
+        const match = String(params.request.url).match(/\/conversation\/([0-9a-f-]{36})/)
           ?? String(params.request.postData ?? "").match(/"conversation_id":"([0-9a-f-]{36})"/);
         if (match) conversationId ??= match[1];
       }
-      if (message.method === "Network.responseReceived" && /\/backend-api\/f\/conversation$/.test(params.response.url)) {
+      if (message.method === "Network.responseReceived" && /\/backend-api\/f\/conversation$/.test(String(params.response?.url ?? ""))) {
         postStatus = params.response.status;
       }
     });
-    await cdp.send("Network.enable", {}, sessionId);
-    await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*backend-api/f/conversation*", requestStage: "Request" }] }, sessionId);
+    const networkEnabled = await cdp.send("Network.enable", {}, sessionId);
+    if (networkEnabled?.error) {
+      throw unavailable("公司網頁版無法啟用網路監聽，未送出", "cdp_unreachable");
+    }
+    const fetchEnabled = await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*backend-api/f/conversation*", requestStage: "Request" }] }, sessionId);
+    if (fetchEnabled?.error) {
+      throw unavailable("公司網頁版無法啟用請求攔截，未送出", "cdp_unreachable");
+    }
 
     const api = async (apiPath, method = "GET", body = null) => evaluate(`(async () => {
-      const token = (await (await fetch("/api/auth/session")).json()).accessToken;
-      const response = await fetch(${JSON.stringify("/backend-api" + apiPath)}, { method: ${JSON.stringify(method)},
-        headers: { authorization: "Bearer " + token, "content-type": "application/json" }, ${body ? `body: ${JSON.stringify(JSON.stringify(body))},` : ""} });
+      const auth = await fetch("/api/auth/session").then((r) => r.json()).catch(() => null);
+      const token = auth?.accessToken ?? "";
+      const response = await fetch(${safeJsonForJs("/backend-api" + apiPath)}, { method: ${safeJsonForJs(method)},
+        headers: { ...(token ? { authorization: "Bearer " + token } : {}), "content-type": "application/json" }, ${body ? `body: ${safeJsonForJs(JSON.stringify(body))},` : ""} });
       return { status: response.status, body: await response.text() };
     })()`);
 
-    // 鎖帳號：設定檔被切走或登出時寧可不送，也不能吃到別的帳號額度。
     let session = null;
     for (let i = 0; i < 20 && !session?.user; i++) {
-      await sleep(500);
+      if (signal?.aborted) throw unavailable("請求已取消", "aborted");
+      await sleep(500, signal);
+      if (signal?.aborted) throw unavailable("請求已取消", "aborted");
       session = await evaluate(`fetch("/api/auth/session").then(r => r.json()).catch(() => null)`).catch(() => null);
     }
     const email = session?.user?.email ?? null;
@@ -213,9 +487,13 @@ export const sendWebConversation = async ({
     }
 
     const catalog = await api("/models?iim=false&include_icons=false&is_gizmo=false");
-    if (catalog.status !== 200) throw unavailable("公司網頁版讀不到模型目錄，未送出", "catalog_unavailable");
-    const availableModels = JSON.parse(catalog.body)?.models ?? [];
-    if (!availableModels.some((entry) => entry.slug === model)) {
+    if (!catalog || catalog.status !== 200) throw unavailable("公司網頁版讀不到模型目錄，未送出", "catalog_unavailable");
+    const parsedCatalog = safeParseJson(catalog.body);
+    if (!parsedCatalog || !Array.isArray(parsedCatalog.models)) {
+      throw unavailable("公司網頁版模型目錄格式異常，未送出", "catalog_unavailable");
+    }
+    const availableModels = parsedCatalog.models;
+    if (!availableModels.some((entry) => entry?.slug === model)) {
       throw new ChatGPTDesktopError(`公司帳號不支援原模型 ${model}，未送出，也未替換模型`, {
         stage: "model_not_available", status: 400,
       });
@@ -230,9 +508,9 @@ export const sendWebConversation = async ({
       return false;
     })()`);
     if (!focused) throw unavailable("公司網頁版找不到輸入框（頁面改版或沒渲染）", "client_not_found");
-    // 頁面剛載入時編輯器可能還沒接上 React，打進去的字不算數、送出鈕維持停用；等不到就重打一次。
     let clicked = false;
     for (let attempt = 0; attempt < 2 && !clicked; attempt++) {
+      if (signal?.aborted) throw unavailable("請求已取消", "aborted");
       await cdp.send("Input.insertText", { text: "." }, sessionId);
       clicked = await evaluate(`(async () => {
         for (let i = 0; i < 16; i++) {
@@ -246,12 +524,12 @@ export const sendWebConversation = async ({
     if (!clicked) throw unavailable("公司網頁版送出按鈕不可用", "client_not_found");
     try {
       const sends = checkDailyBudget(readSends(budgetFile), null).recent;
-      fs.writeFileSync(budgetFile, JSON.stringify([...sends, Date.now()]));
+      writeSendsAtomic(budgetFile, [...sends, Date.now()]);
     } catch {}
 
     while (!conversationId && !(postStatus >= 400) && Date.now() - started < 90000) {
       if (signal?.aborted) throw unavailable("請求已取消", "aborted");
-      await sleep(500);
+      await sleep(500, signal);
     }
     if (postStatus === 429 || postStatus === 403) {
       throw rateLimited(`公司網頁版拒收（HTTP ${postStatus}）`, postStatus === 403 ? 15 * 60 * 1000 : 10 * 60 * 1000);
@@ -259,37 +537,42 @@ export const sendWebConversation = async ({
     if (postStatus >= 400) throw unavailable(`公司網頁版送出失敗（HTTP ${postStatus}）`, "send_rejected");
     if (!conversationId) throw rateLimited("公司網頁版送出後 90 秒沒拿到對話 ID", 30000);
 
-    // 跟桌面版撈答案同一套：stream_status 不吃讀取額度，結束後才讀一次整段對話；每 4 輪抽查一次是否已卡在 <| 殭屍結尾。
     let streamStatus = null;
     let statusPolls = 0;
     while (Date.now() - started < timeoutMs) {
       if (signal?.aborted) throw unavailable("請求已取消", "aborted");
       const reply = await api(`/conversation/${conversationId}/stream_status`);
-      if (reply.status === 429) throw rateLimited("公司網頁版讀取被限流（stream_status 429）", 10 * 60 * 1000);
-      streamStatus = reply.status === 200 ? JSON.parse(reply.body).status : `http${reply.status}`;
+      if (reply?.status === 429) throw rateLimited("公司網頁版讀取被限流（stream_status 429）", 10 * 60 * 1000);
+      const parsedStatus = reply?.status === 200 ? safeParseJson(reply.body) : null;
+      streamStatus = reply?.status === 200
+        ? (parsedStatus?.status ?? "invalid_json")
+        : `http${reply?.status ?? "error"}`;
       if (streamStatus !== "IS_STREAMING") break;
       statusPolls += 1;
       if (statusPolls % 4 === 0) {
         const probeConv = await api(`/conversation/${conversationId}`);
-        if (probeConv.status === 200) {
-          const probeAns = extractFinalAnswer(JSON.parse(probeConv.body));
+        if (probeConv?.status === 200) {
+          const parsedProbe = safeParseJson(probeConv.body);
+          const probeAns = parsedProbe ? extractFinalAnswer(parsedProbe) : null;
           if (probeAns?.status === "finished_successfully" && probeAns.text) break;
         }
       }
-      await sleep(5000);
+      await sleep(5000, signal);
     }
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (signal?.aborted) throw unavailable("請求已取消", "aborted");
       const reply = await api(`/conversation/${conversationId}`);
-      if (reply.status === 429) throw rateLimited("公司網頁版讀取被限流（conversation 429）", 10 * 60 * 1000);
-      if (reply.status !== 200) throw rateLimited(`公司網頁版讀不到對話（HTTP ${reply.status}）`, 30000);
-      const answer = extractFinalAnswer(JSON.parse(reply.body));
+      if (reply?.status === 429) throw rateLimited("公司網頁版讀取被限流（conversation 429）", 10 * 60 * 1000);
+      if (reply?.status !== 200) throw rateLimited(`公司網頁版讀不到對話（HTTP ${reply?.status ?? "error"}）`, 30000);
+      const parsedConv = safeParseJson(reply.body);
+      if (!parsedConv) throw rateLimited("公司網頁版對話回應非有效 JSON", 30000);
+      const answer = extractFinalAnswer(parsedConv);
       if (answer?.status === "finished_successfully" && answer.text) {
         if (answer.model && answer.model !== model) {
           throw new ChatGPTDesktopError(`公司帳號回覆模型 ${answer.model} 與原模型 ${model} 不符，未採用答案`, {
             stage: "model_mismatch", retrySafe: false, status: 502,
           });
         }
-        // 網頁版不回 token 數，跟桌面版一樣用字元估算，讓 Magpie 的用量紀錄量得到公司帳號接了多少。
         const promptTokens = estimateTokenCount(prompt);
         const completionTokens = estimateTokenCount(answer.text);
         return {
@@ -297,37 +580,50 @@ export const sendWebConversation = async ({
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
         };
       }
-      await sleep(5000);
+      await sleep(5000, signal);
     }
     throw rateLimited(`公司網頁版回答停在半截（串流狀態 ${streamStatus}）`, 30000);
   } catch (error) {
-    // 公司備援也可能已生成；沒有明確拒收時，禁止閘道或呼叫端再補送。
     if (sendAttempted && !(postStatus >= 400)) {
-      throw new ChatGPTDesktopError(String(error?.message ?? error), {
+      throw new ChatGPTDesktopError(redactSecrets(error?.message ?? error), {
         stage: error?.stage === "model_mismatch" ? "model_mismatch" : "unknown_send_state",
         retrySafe: false, status: 502,
       });
     }
     throw error;
   } finally {
-    if (targetId) await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+    if (targetId) await cdp.send("Target.closeTarget", { targetId }, undefined, 1500, { bypassAbort: true }).catch(() => {});
     cdp.close();
   }
 };
 
 const errorResponse = (error) => {
-  const retryAfterMs = error?.details?.retryAfterMs ?? 60000;
+  const rawRetry = error?.details?.retryAfterMs;
+  const retryAfterMs = typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : 60000;
   const status = error?.retrySafe === false ? 502 : error?.status === 429 ? 429 : error?.status === 413 ? 413 : error?.status === 400 ? 400 : 503;
-  return new Response(JSON.stringify({ error: { message: String(error?.message ?? error), type: error?.stage ?? "unavailable", code: error?.stage ?? "unavailable" } }), {
-    status,
-    headers: { "content-type": "application/json", "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))), ...(error?.retrySafe === false ? { "X-Should-Retry": "false" } : {}) },
-  });
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: redactSecrets(error?.message ?? error),
+        type: error?.stage ?? "unavailable",
+        code: error?.stage ?? "unavailable",
+      },
+    }),
+    {
+      status,
+      headers: {
+        "content-type": "application/json",
+        "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))),
+        ...(error?.retrySafe === false ? { "X-Should-Retry": "false" } : {}),
+      },
+    },
+  );
 };
 
 export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
   const providerId = pluginOptions?.providerId ?? "chatgpt-web-biz";
   const cdpUrl = pluginOptions?.cdpUrl ?? `http://127.0.0.1:${WEB_DEFAULT_PORT}`;
-  // 預期帳號放在本機設定檔、不進 repo；讀不到就一律不送（鎖帳號是硬條件）。
+  const serialQueue = createSerialQueue();
   const expectedEmail = () => {
     if (pluginOptions?.expectedEmail) return pluginOptions.expectedEmail;
     try {
@@ -367,7 +663,7 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
                 await ensureBrowser({ cdpUrl, launcher: pluginOptions?.launcher ?? path.join(WEB_HOME, "launch.sh") });
                 return { type: "success", refresh: cdpUrl, access: cdpUrl, expires: 0, accountId: expectedEmail() ?? "ChatGPT Web" };
               } catch (error) {
-                return { type: "failed", error: String(error?.message ?? error) };
+                return { type: "failed", error: redactSecrets(error?.message ?? error) };
               }
             },
           };
@@ -379,22 +675,45 @@ export async function chatgptWebBizPlugin(_input, pluginOptions = {}) {
           baseURL: "http://127.0.0.1/v1",
           fetch: async (_url, init = {}) => {
             let payload;
-            try { payload = JSON.parse(typeof init?.body === "string" ? init.body : String(init?.body ?? "{}")); }
-            catch { return errorResponse(new ChatGPTDesktopError("無效的 JSON 請求內容", { stage: "unsupported_input", status: 400 })); }
             try {
+              payload = JSON.parse(decodeBodyToString(init?.body));
+            } catch {
+              return errorResponse(new ChatGPTDesktopError("無效的 JSON 請求內容", { stage: "unsupported_input", status: 400 }));
+            }
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+              return errorResponse(new ChatGPTDesktopError("無效的 JSON 請求內容", { stage: "unsupported_input", status: 400 }));
+            }
+            try {
+              if (
+                (Array.isArray(payload.attachments) && payload.attachments.length > 0) ||
+                (Array.isArray(payload.files) && payload.files.length > 0) ||
+                payload.image != null ||
+                payload.audio != null
+              ) {
+                throw new ChatGPTDesktopError("不支援非文字附件輸入", {
+                  stage: "unsupported_input",
+                  retrySafe: true,
+                  status: 400,
+                });
+              }
+              const formattedPrompt = formatMessagesToPrompt(payload.messages ?? payload.prompt);
               const effort = payload.reasoning_effort ?? payload.reasoning?.effort ?? "standard";
-              const result = await sendWebConversation({
-                cdpUrl,
-                launcher: pluginOptions?.launcher,
-                expectedEmail: expectedEmail(),
-                prompt: formatMessagesToPrompt(payload.messages ?? payload.prompt),
-                model: payload.model,
-                effort,
-                timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
-                dailyBudget: pluginOptions?.dailyBudget ?? null,
-                budgetFile: pluginOptions?.budgetFile,
-                signal: init?.signal,
-              });
+              const result = await serialQueue.run(
+                () =>
+                  sendWebConversation({
+                    cdpUrl,
+                    launcher: pluginOptions?.launcher,
+                    expectedEmail: expectedEmail(),
+                    prompt: formattedPrompt,
+                    model: payload.model,
+                    effort,
+                    timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
+                    dailyBudget: pluginOptions?.dailyBudget ?? null,
+                    budgetFile: pluginOptions?.budgetFile,
+                    signal: init?.signal,
+                  }),
+                init?.signal,
+              );
               const id = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);
               if (payload.stream === true) {

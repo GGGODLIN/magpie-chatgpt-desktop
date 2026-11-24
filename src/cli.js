@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   ChatGPTDesktopError,
+  MAX_PROMPT_BYTES,
   buildChatExpression,
   buildModelsExpression,
   buildProbeExpression,
@@ -11,8 +12,12 @@ import {
   preferredClientExports,
   probeClient,
   recordFallbackLog,
+  redactSecrets,
   sendConversation,
 } from "./core.js";
+
+const CLI_USAGE =
+  "Usage: magpie-chatgpt-desktop [--probe | --render-expression <probe|models|resolver|chat> [json] | [--instant-fallback|--no-instant-fallback] [model]]\n";
 
 const pluginVersion = () => {
   try {
@@ -26,10 +31,27 @@ const pluginVersion = () => {
   }
 };
 
-const readStreamText = async (stream) => {
+const readStreamText = async (stream, maxBytes = MAX_PROMPT_BYTES * 4) => {
+  if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
+    throw new Error("無效的 stdin 串流");
+  }
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of stream) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    const buf = Buffer.isBuffer(chunk)
+      ? chunk
+      : typeof chunk === "string"
+        ? Buffer.from(chunk, "utf8")
+        : ArrayBuffer.isView(chunk)
+          ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : chunk instanceof ArrayBuffer
+            ? Buffer.from(chunk)
+            : Buffer.from(String(chunk), "utf8");
+    totalBytes += buf.length;
+    if (totalBytes > maxBytes) {
+      throw new Error(`stdin 內容超過讀取上限（${maxBytes} bytes）`);
+    }
+    chunks.push(buf);
   }
   return Buffer.concat(chunks).toString("utf8");
 };
@@ -54,6 +76,11 @@ export const runCli = async (
     logPath,
   } = {},
 ) => {
+  if (argv[0] === "--help" || argv[0] === "-h") {
+    writeStdout(CLI_USAGE);
+    return 0;
+  }
+
   if (argv[0] === "--render-expression") {
     const kind = argv[1];
     const preferred = preferredClientExports(env);
@@ -71,18 +98,21 @@ export const runCli = async (
     }
     if (kind === "chat") {
       let options = {};
-      if (argv[2]) {
+      if (argv[2] !== undefined) {
         try {
           options = JSON.parse(argv[2]);
         } catch (error) {
           writeStderr(`無效的 options JSON：${error?.message ?? error}\n`);
           return 1;
         }
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+          writeStderr("無效的 options JSON：options 必須為 JSON 物件\n");
+          return 1;
+        }
       }
       writeStdout(buildChatExpression(options, preferred));
       return 0;
     }
-    // 呼叫端靠版本號判斷「已安裝的外掛太舊、不認得這個類型」。
     writeStderr(
       `不支援的 expression 類型：${kind ?? ""}（magpie-chatgpt-desktop ${pluginVersion()}）\n`,
     );
@@ -109,7 +139,7 @@ export const runCli = async (
       writeStdout(
         JSON.stringify({
           ok: false,
-          error: String(error?.message ?? error),
+          error: redactSecrets(error?.message ?? error),
         }) + "\n",
       );
       return 1;
@@ -118,16 +148,42 @@ export const runCli = async (
 
   const flags = new Set();
   const positional = [];
+  let acceptFlags = true;
   for (const arg of argv) {
-    if (arg === "--instant-fallback" || arg === "--no-instant-fallback") {
+    if (acceptFlags && arg === "--") {
+      acceptFlags = false;
+      continue;
+    }
+    if (acceptFlags && (arg === "--help" || arg === "-h")) {
+      writeStdout(CLI_USAGE);
+      return 0;
+    }
+    if (acceptFlags && (arg === "--instant-fallback" || arg === "--no-instant-fallback")) {
       flags.add(arg);
+    } else if (acceptFlags && typeof arg === "string" && arg.startsWith("-")) {
+      writeStderr(`不支援的參數：${arg}\n`);
+      return 1;
     } else {
       positional.push(arg);
     }
   }
 
-  const rawPrompt =
-    stdinText !== undefined ? String(stdinText) : await readStreamText(stdin);
+  if (flags.has("--instant-fallback") && flags.has("--no-instant-fallback")) {
+    writeStderr("不可同時指定 --instant-fallback 與 --no-instant-fallback\n");
+    return 1;
+  }
+
+  let rawPrompt;
+  if (stdinText !== undefined) {
+    rawPrompt = String(stdinText);
+  } else {
+    try {
+      rawPrompt = await readStreamText(stdin);
+    } catch (error) {
+      writeStderr(`讀取 stdin 失敗：${redactSecrets(error?.message ?? error)}\n`);
+      return 1;
+    }
+  }
   const prompt = rawPrompt.trim();
   if (!prompt) {
     writeStderr("stdin 沒有內容\n");
@@ -232,7 +288,7 @@ export const runCli = async (
     writeStdout(`${result.answer}\n`);
     return 0;
   } catch (error) {
-    const message = String(error?.message ?? error);
+    const message = redactSecrets(error?.message ?? error);
     if (error?.retrySafe === false) {
       writeStderr(
         `SIDECAR_WEB_RETRY_UNSAFE ${JSON.stringify({ error: message })}\n`,

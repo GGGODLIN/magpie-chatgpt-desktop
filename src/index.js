@@ -6,6 +6,8 @@ import {
   ChatGPTDesktopError,
   DEFAULT_CDP_PORT,
   checkPortFree,
+  createSerialQueue,
+  decodeBodyToString,
   finishFallbackLog,
   formatMessagesToPrompt,
   isChatGPTAppCommand,
@@ -14,12 +16,14 @@ import {
   parsePortOrCdpInput,
   probeClient,
   recordFallbackLog,
+  redactSecrets,
   resolveCdpPort,
   sendConversation,
 } from "./core.js";
 
 export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
   const providerId = "chatgpt-desktop";
+  const serialQueue = createSerialQueue();
   let desktopUnavailableUntil = 0;
   let desktopFailures = 0;
   const modelUnavailableUntil = new Map();
@@ -58,9 +62,16 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
         return `ChatGPT Desktop 模型配額已滿（Quota exceeded: model_cap_exceeded, resets at ${resetIso} UTC+0, please switch to the other models）。如需自動退回 Instant 模型，請開啟供應商設定的「instant_fallback」開關。`;
       }
       case "rate_limited": {
-        const waitMin = Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 180000) / 60000));
+        const rawRetry = error?.details?.retryAfterMs;
+        const safeRetry =
+          typeof rawRetry === "number" && Number.isFinite(rawRetry)
+            ? rawRetry
+            : 180000;
+        const waitMin = Math.max(1, Math.ceil(safeRetry / 60000));
         return `ChatGPT Desktop 暫時不收請求、約 ${waitMin} 分鐘後再試（Rate limit exceeded, try again in ${waitMin}m）。`;
       }
+      case "aborted":
+        return "ChatGPT Desktop 請求已取消（Request aborted）。";
       case "unknown_send_state":
         return "ChatGPT Desktop 對話請求已送出但連線中斷或未確認完成狀態（Unknown send state）；為避免重複扣額，請勿自動重送。";
       default:
@@ -70,7 +81,24 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
 
   const readDesktopState = () => {
     if (stateFile) {
-      const raw = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      } catch (error) {
+        throw new ChatGPTDesktopError("無法讀取或解析桌面版狀態檔", {
+          stage: "cdp_unreachable",
+          retrySafe: true,
+          status: 503,
+          cause: error,
+        });
+      }
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new ChatGPTDesktopError("桌面版狀態檔格式無效", {
+          stage: "cdp_unreachable",
+          retrySafe: true,
+          status: 503,
+        });
+      }
       const running = Boolean(raw.running);
       const debuggingPort =
         typeof raw.debuggingPort === "number" ? raw.debuggingPort : null;
@@ -410,7 +438,12 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           prompts: [restartPromptSpec],
           async ask(inputs = {}) {
             if (inputs?.restart_action) return null;
-            const desktop = readDesktopState();
+            let desktop;
+            try {
+              desktop = readDesktopState();
+            } catch {
+              return null;
+            }
             if (desktop.platform !== "darwin" || !desktop.appInstalled) {
               return null;
             }
@@ -429,69 +462,76 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
               instructions: "Connecting to local macOS ChatGPT Desktop...",
               method: "auto",
               async callback() {
-                const desktop = readDesktopState();
-                if (desktop.platform !== "darwin" || !desktop.appInstalled) {
-                  return {
-                    type: "failed",
-                    error:
-                      "此供應商需要安裝 macOS 版官方 ChatGPT 桌面應用程式（/Applications/ChatGPT.app）。",
-                  };
-                }
+                try {
+                  const desktop = readDesktopState();
+                  if (desktop.platform !== "darwin" || !desktop.appInstalled) {
+                    return {
+                      type: "failed",
+                      error:
+                        "此供應商需要安裝 macOS 版官方 ChatGPT 桌面應用程式（/Applications/ChatGPT.app）。",
+                    };
+                  }
 
-                if (desktop.running) {
-                  const probe = await probeExistingDesktop(desktop);
-                  if (probe.ok) {
+                  if (desktop.running) {
+                    const probe = await probeExistingDesktop(desktop);
+                    if (probe.ok) {
+                      return {
+                        type: "success",
+                        refresh: probe.cdpUrl,
+                        access: probe.cdpUrl,
+                        expires: 0,
+                        accountId: "ChatGPT Desktop",
+                      };
+                    }
+                    if (probe.cdpReachable) {
+                      return {
+                        type: "failed",
+                        error: formatDiagnostic(probe.error),
+                      };
+                    }
+                    if (inputs?.restart_action !== "restart") {
+                      return {
+                        type: "failed",
+                        error:
+                          "已取消自動重開：未關閉執行中的 ChatGPT.app。請手動以除錯埠模式重開桌面版，或在登入選單選擇自動重開。",
+                      };
+                    }
+                    const restarted = await launchOrRestartDesktop(desktop, true);
+                    if (!restarted.ok) {
+                      return {
+                        type: "failed",
+                        error: formatDiagnostic(restarted.error),
+                      };
+                    }
                     return {
                       type: "success",
-                      refresh: probe.cdpUrl,
-                      access: probe.cdpUrl,
+                      refresh: restarted.cdpUrl,
+                      access: restarted.cdpUrl,
                       expires: 0,
                       accountId: "ChatGPT Desktop",
                     };
                   }
-                  if (probe.cdpReachable) {
+
+                  const launched = await launchOrRestartDesktop(desktop, false);
+                  if (!launched.ok) {
                     return {
                       type: "failed",
-                      error: formatDiagnostic(probe.error),
-                    };
-                  }
-                  if (inputs?.restart_action !== "restart") {
-                    return {
-                      type: "failed",
-                      error:
-                        "已取消自動重開：未關閉執行中的 ChatGPT.app。請手動以除錯埠模式重開桌面版，或在登入選單選擇自動重開。",
-                    };
-                  }
-                  const restarted = await launchOrRestartDesktop(desktop, true);
-                  if (!restarted.ok) {
-                    return {
-                      type: "failed",
-                      error: formatDiagnostic(restarted.error),
+                      error: formatDiagnostic(launched.error),
                     };
                   }
                   return {
                     type: "success",
-                    refresh: restarted.cdpUrl,
-                    access: restarted.cdpUrl,
+                    refresh: launched.cdpUrl,
+                    access: launched.cdpUrl,
                     expires: 0,
                     accountId: "ChatGPT Desktop",
                   };
-                }
-
-                const launched = await launchOrRestartDesktop(desktop, false);
-                if (!launched.ok) {
+                } catch (error) {
                   return {
                     type: "failed",
-                    error: formatDiagnostic(launched.error),
+                    error: formatDiagnostic(error),
                   };
                 }
-                return {
-                  type: "success",
-                  refresh: launched.cdpUrl,
-                  access: launched.cdpUrl,
-                  expires: 0,
-                  accountId: "ChatGPT Desktop",
-                };
               },
             };
           },
@@ -533,14 +573,22 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
           fetch: async (_requestUrl, init = {}) => {
             let payload = {};
             try {
-              const rawBody =
-                typeof init?.body === "string"
-                  ? init.body
-                  : init?.body
-                    ? String(init.body)
-                    : "{}";
-              payload = JSON.parse(rawBody);
+              payload = JSON.parse(decodeBodyToString(init?.body));
             } catch {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    message: "無效的 JSON 請求內容（Invalid JSON body）。",
+                    type: "invalid_request_error",
+                  },
+                }),
+                {
+                  status: 400,
+                  headers: { "content-type": "application/json" },
+                },
+              );
+            }
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
               return new Response(
                 JSON.stringify({
                   error: {
@@ -557,11 +605,11 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
 
             try {
               if (
-                (Array.isArray(payload?.attachments) &&
+                (Array.isArray(payload.attachments) &&
                   payload.attachments.length > 0) ||
-                (Array.isArray(payload?.files) && payload.files.length > 0) ||
-                payload?.image != null ||
-                payload?.audio != null
+                (Array.isArray(payload.files) && payload.files.length > 0) ||
+                payload.image != null ||
+                payload.audio != null
               ) {
                 throw new ChatGPTDesktopError("不支援非文字附件輸入", {
                   stage: "unsupported_input",
@@ -573,26 +621,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
               const formattedPrompt = formatMessagesToPrompt(
                 payload.messages ?? payload.prompt,
               );
-              const auth =
-                typeof getAuth === "function" ? await getAuth() : null;
-              const cdpUrl = await resolveActiveCdpUrl(auth);
-              const companyFallback = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
-              const sendToCompany = async () => {
-                if (init?.signal?.aborted) throw init.signal.reason ?? new Error("Request aborted");
-                const company = await chatgptWebBizPlugin(input, pluginOptions?.companyBackup ?? {});
-                const loader = await company.auth.loader();
-                const response = await loader.fetch(_requestUrl, { ...init, body: JSON.stringify(payload) });
-                response.headers.set("X-ChatGPT-Account-Source", "company");
-                return response;
-              };
               const requestedModel = typeof payload.model === "string" ? payload.model.trim() : "";
-              const modelCooldownUntil = modelUnavailableUntil.get(requestedModel) ?? 0;
-              if (companyFallback && (Date.now() < desktopUnavailableUntil || Date.now() < modelCooldownUntil)) {
-                return await sendToCompany();
-              }
-              const instantFallback = !companyFallback && Boolean(
-                input?.magpie?.option?.(providerId, "instant_fallback"),
-              );
               const effort =
                 typeof payload.reasoning_effort === "string" &&
                 payload.reasoning_effort.trim()
@@ -602,88 +631,124 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     ? payload.reasoning.effort.trim()
                     : "standard";
 
-              const result = await sendConversation({
-                cdpUrl,
-                prompt: formattedPrompt,
-                model: payload.model,
-                effort,
-                instantFallback,
-                allowProFallback: true,
-                timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
-                targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
-                dailyBudget: pluginOptions?.dailyBudget ?? null,
-                signal: init?.signal,
-                onFallbackStart: ({ fallbackId, requestedModel }) => {
-                  try {
-                    recordFallbackLog("fallback_started", fallbackId, requestedModel, {
-                      reason_code: "model_cap_exceeded",
-                      fallback_mode: "Instant",
+              const result = await serialQueue.run(async () => {
+                const companyFallback = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
+                const sendToCompany = async () => {
+                  if (init?.signal?.aborted) {
+                    throw new ChatGPTDesktopError("請求已取消", {
+                      stage: "aborted",
+                      retrySafe: true,
+                      status: 502,
+                      details: { aborted: true },
                     });
-                  } catch {
-                    // 外掛宿主內紀錄寫入失敗不阻擋請求。
                   }
-                },
-                onFallbackFailed: ({ fallbackId, requestedModel, error: fbErr }) => {
-                  finishFallbackLog(
-                    "fallback_failed",
-                    fallbackId,
-                    requestedModel,
-                    {
-                      retry_safe: Boolean(fbErr?.retrySafe),
-                      reason_code: fbErr?.details?.errorCode ?? null,
-                    },
-                    { writeStderr: () => {} },
-                  );
-                },
-                onFallbackComplete: ({ fallbackId, requestedModel, result: okRes }) => {
-                  finishFallbackLog(
-                    "fallback_completed",
-                    fallbackId,
-                    requestedModel,
-                    {
-                      sent_model: okRes.requestedModel,
-                      actual_model: okRes.model,
-                      conversation_id: okRes.conversationId,
-                    },
-                    { writeStderr: () => {} },
-                  );
-                },
-              }).catch(async (error) => {
-                const canSwitchAccount = companyFallback
-                  && error instanceof ChatGPTDesktopError
-                  && !["unsupported_input", "context_length_exceeded"].includes(error.stage)
-                  && (error.status === 429 || error.status >= 500);
-                if (canSwitchAccount) {
-                  if (error.stage === "quota_exceeded") {
-                    const count = (modelFailures.get(requestedModel) ?? 0) + 1;
-                    if (requestedModel) modelFailures.set(requestedModel, count);
-                    const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(count - 1, 4));
-                    const until = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
-                    if (requestedModel) {
-                      modelUnavailableUntil.set(requestedModel, Math.max(modelUnavailableUntil.get(requestedModel) ?? 0, until));
-                    }
-                    for (const [slug, resetIso] of Object.entries(error?.details?.limitedModels ?? {})) {
-                      const parsed = Date.parse(String(resetIso));
-                      if (Number.isFinite(parsed) && parsed > Date.now()) {
-                        modelUnavailableUntil.set(slug, Math.max(modelUnavailableUntil.get(slug) ?? 0, parsed));
-                      }
-                    }
-                  } else if (error.stage === "rate_limited" && error?.details?.accountCooldown === true) {
-                    desktopFailures += 1;
-                    const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
-                    desktopUnavailableUntil = Date.now() + Math.max(error?.details?.retryAfterMs ?? 0, recoveryBackoffMs);
-                  }
+                  const company = await chatgptWebBizPlugin(input, pluginOptions?.companyBackup ?? {});
+                  const loader = await company.auth.loader();
+                  const response = await loader.fetch(_requestUrl, { ...init, body: JSON.stringify(payload) });
+                  response.headers.set("X-ChatGPT-Account-Source", "company");
+                  return response;
+                };
+                const modelCooldownUntil = modelUnavailableUntil.get(requestedModel) ?? 0;
+                if (companyFallback && (Date.now() < desktopUnavailableUntil || Date.now() < modelCooldownUntil)) {
+                  return await sendToCompany();
                 }
-                if (!canSwitchAccount || init?.signal?.aborted) throw error;
-                return sendToCompany();
-              });
+                const instantFallback = !companyFallback && Boolean(
+                  input?.magpie?.option?.(providerId, "instant_fallback"),
+                );
+
+                const desktopOutcome = await (async () => {
+                  const auth =
+                    typeof getAuth === "function" ? await getAuth() : null;
+                  const cdpUrl = await resolveActiveCdpUrl(auth);
+                  return await sendConversation({
+                    cdpUrl,
+                    prompt: formattedPrompt,
+                    model: payload.model,
+                    effort,
+                    instantFallback,
+                    allowProFallback: true,
+                    timeoutMs: pluginOptions?.chatTimeoutMs ?? 420000,
+                    targetTimeoutMs: pluginOptions?.targetTimeoutMs ?? 4000,
+                    dailyBudget: pluginOptions?.dailyBudget ?? null,
+                    signal: init?.signal,
+                    onFallbackStart: ({ fallbackId, requestedModel }) => {
+                      try {
+                        recordFallbackLog("fallback_started", fallbackId, requestedModel, {
+                          reason_code: "model_cap_exceeded",
+                          fallback_mode: "Instant",
+                        });
+                      } catch {
+                      }
+                    },
+                    onFallbackFailed: ({ fallbackId, requestedModel, error: fbErr }) => {
+                      finishFallbackLog(
+                        "fallback_failed",
+                        fallbackId,
+                        requestedModel,
+                        {
+                          retry_safe: Boolean(fbErr?.retrySafe),
+                          reason_code: fbErr?.details?.errorCode ?? null,
+                        },
+                        { writeStderr: () => {} },
+                      );
+                    },
+                    onFallbackComplete: ({ fallbackId, requestedModel, result: okRes }) => {
+                      finishFallbackLog(
+                        "fallback_completed",
+                        fallbackId,
+                        requestedModel,
+                        {
+                          sent_model: okRes.requestedModel,
+                          actual_model: okRes.model,
+                          conversation_id: okRes.conversationId,
+                        },
+                        { writeStderr: () => {} },
+                      );
+                    },
+                  });
+                })().catch(async (error) => {
+                  const canSwitchAccount = companyFallback
+                    && error instanceof ChatGPTDesktopError
+                    && !["unsupported_input", "context_length_exceeded", "aborted"].includes(error.stage)
+                    && (error.status === 429 || error.status >= 500);
+                  if (canSwitchAccount) {
+                    if (error.stage === "quota_exceeded") {
+                      const count = (modelFailures.get(requestedModel) ?? 0) + 1;
+                      if (requestedModel) modelFailures.set(requestedModel, count);
+                      const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(count - 1, 4));
+                      const rawRetry = error?.details?.retryAfterMs;
+                      const safeRetry = typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : 0;
+                      const until = Date.now() + Math.max(safeRetry, recoveryBackoffMs);
+                      if (requestedModel) {
+                        modelUnavailableUntil.set(requestedModel, Math.max(modelUnavailableUntil.get(requestedModel) ?? 0, until));
+                      }
+                      for (const [slug, resetIso] of Object.entries(error?.details?.limitedModels ?? {})) {
+                        const parsed = Date.parse(String(resetIso));
+                        if (Number.isFinite(parsed) && parsed > Date.now()) {
+                          modelUnavailableUntil.set(slug, Math.max(modelUnavailableUntil.get(slug) ?? 0, parsed));
+                        }
+                      }
+                    } else if (error.stage === "rate_limited" && error?.details?.accountCooldown === true) {
+                      desktopFailures += 1;
+                      const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
+                      const rawRetry = error?.details?.retryAfterMs;
+                      const safeRetry = typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : 0;
+                      desktopUnavailableUntil = Date.now() + Math.max(safeRetry, recoveryBackoffMs);
+                    }
+                  }
+                  if (!canSwitchAccount || init?.signal?.aborted) throw error;
+                  return sendToCompany();
+                });
+                if (desktopOutcome instanceof Response) return desktopOutcome;
+                desktopFailures = 0;
+                desktopUnavailableUntil = 0;
+                if (requestedModel) {
+                  modelFailures.delete(requestedModel);
+                  modelUnavailableUntil.delete(requestedModel);
+                }
+                return desktopOutcome;
+              }, init?.signal);
               if (result instanceof Response) return result;
-              desktopFailures = 0;
-              desktopUnavailableUntil = 0;
-              if (requestedModel) {
-                modelFailures.delete(requestedModel);
-                modelUnavailableUntil.delete(requestedModel);
-              }
 
               const completionId = `chatcmpl-${result.conversationId ?? crypto.randomUUID()}`;
               const created = Math.floor(Date.now() / 1000);
@@ -755,9 +820,13 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
               );
             } catch (error) {
               const companyBackupEnabled = Boolean(input?.magpie?.option?.(providerId, "company_fallback"));
+              const safeErrorMessage = redactSecrets(error?.message ?? "");
               const message = formatDiagnostic(error) + (companyBackupEnabled && error?.stage === "rate_limited"
-                ? ` [backup: outcome=${error?.details?.outcome ?? "unknown"}, conversation=${Boolean(error?.details?.conversationId)}; ${error?.message ?? ""}]`
+                ? ` [backup: outcome=${error?.details?.outcome ?? "unknown"}, conversation=${Boolean(error?.details?.conversationId)}; ${safeErrorMessage}]`
                 : "");
+              const rawRetry = error?.details?.retryAfterMs;
+              const safeRetryAfterMs = (fallbackMs) =>
+                typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : fallbackMs;
               if (
                 error?.stage === "context_length_exceeded" ||
                 error?.status === 413
@@ -806,7 +875,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                       outcome: error?.details?.outcome ?? null,
                       conversation_created: Boolean(error?.details?.conversationId),
                       company_backup_enabled: Boolean(input?.magpie?.option?.(providerId, "company_fallback")),
-                      reason: error?.message ?? null,
+                      reason: safeErrorMessage.length > 0 ? safeErrorMessage : null,
                     },
                   }),
                   {
@@ -814,7 +883,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     headers: {
                       "content-type": "application/json",
                       "Retry-After": String(
-                        Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 180000) / 1000)),
+                        Math.max(1, Math.ceil(safeRetryAfterMs(180000) / 1000)),
                       ),
                     },
                   },
@@ -858,7 +927,7 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     headers: {
                       "content-type": "application/json",
                       "Retry-After": String(
-                        Math.max(1, Math.ceil((error?.details?.retryAfterMs ?? 60000) / 1000)),
+                        Math.max(1, Math.ceil(safeRetryAfterMs(60000) / 1000)),
                       ),
                     },
                   },
