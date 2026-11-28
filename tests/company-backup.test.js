@@ -227,6 +227,69 @@ describe("same-model company account backup", () => {
     expect(state.companyCalls).toBe(0);
   });
 
+  test("switches to company account and cools down model when Desktop hits remote 400 context_length_exceeded", async () => {
+    const { state, loader } = await fixture({
+      desktop: {
+        error: "提示內容超過模型上下文或單一訊息長度上限（context_length_exceeded）",
+        stage: "context_length_exceeded",
+        errorCode: "message_length_exceeds_limit",
+        quotaRejected: false,
+        retrySafe: true,
+      },
+    });
+    const first = await ask(loader, "gpt-6-thinking", "high");
+    expect(first.status).toBe(200);
+    expect(first.headers.get("X-ChatGPT-Account-Source")).toBe("company");
+    expect((await first.json()).choices[0].message.content).toBe("company answer");
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(1);
+    expect(state.sent[0].model).toBe("gpt-6-thinking");
+    // 冷卻期內下一筆同模型直接走公司帳號，不重撞 400
+    const second = await ask(loader, "gpt-6-thinking", "high");
+    expect(second.status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(2);
+  });
+
+  test("does not switch to company account when prompt exceeds local MAX_PROMPT_BYTES (413)", async () => {
+    const { state, loader } = await fixture();
+    const oversized = "a".repeat(500_005);
+    const response = await loader.fetch("http://fixture/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-6-thinking", messages: [{ role: "user", content: oversized }] }),
+    });
+    expect(response.status).toBe(413);
+    expect(state.desktopCalls).toBe(0);
+    expect(state.companyCalls).toBe(0);
+  });
+
+  test("switches to company account and cools down model when Desktop silently swaps model (e.g. gpt-6-thinking -> gpt-6)", async () => {
+    const { state, loader } = await fixture({
+      desktop: {
+        error: undefined,
+        stage: undefined,
+        quotaRejected: undefined,
+        answer: "downgraded desktop answer",
+        model: "gpt-6",
+        requestedModel: "gpt-6-thinking",
+        conversationId: "swapped-conv",
+      },
+    });
+    const first = await ask(loader, "gpt-6-thinking", "high");
+    expect(first.status).toBe(200);
+    expect(first.headers.get("X-ChatGPT-Account-Source")).toBe("company");
+    const body = await first.json();
+    expect(body.model).toBe("gpt-6-thinking");
+    expect(body.choices[0].message.content).toBe("company answer");
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(1);
+    // 冷卻期內下一筆同模型直接走公司帳號
+    const second = await ask(loader, "gpt-6-thinking", "high");
+    expect(second.status).toBe(200);
+    expect(state.desktopCalls).toBe(1);
+    expect(state.sent).toHaveLength(2);
+  });
+
   test("backs up the current request and keeps subsequent requests on the company during Desktop account cooldown", async () => {
     const { state, loader } = await fixture({ desktop: { stage: "rate_limited", accountCooldown: true, retryAfterMs: 30000 } });
     const first = await ask(loader, "gpt-5-6-thinking", "high");

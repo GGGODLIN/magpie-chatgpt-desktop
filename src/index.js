@@ -656,6 +656,22 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   input?.magpie?.option?.(providerId, "instant_fallback"),
                 );
 
+                const cooldownModel = (slug, rawRetry = 0, limitedModels = null) => {
+                  const count = (modelFailures.get(slug) ?? 0) + 1;
+                  if (slug) modelFailures.set(slug, count);
+                  const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(count - 1, 4));
+                  const safeRetry = typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : 0;
+                  const until = Date.now() + Math.max(safeRetry, recoveryBackoffMs);
+                  if (slug) {
+                    modelUnavailableUntil.set(slug, Math.max(modelUnavailableUntil.get(slug) ?? 0, until));
+                  }
+                  for (const [limitedSlug, resetIso] of Object.entries(limitedModels ?? {})) {
+                    const parsed = Date.parse(String(resetIso));
+                    if (Number.isFinite(parsed) && parsed > Date.now()) {
+                      modelUnavailableUntil.set(limitedSlug, Math.max(modelUnavailableUntil.get(limitedSlug) ?? 0, parsed));
+                    }
+                  }
+                };
                 const desktopOutcome = await (async () => {
                   const auth =
                     typeof getAuth === "function" ? await getAuth() : null;
@@ -707,27 +723,17 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                     },
                   });
                 })().catch(async (error) => {
+                  // 進到此 catch 的 context_length_exceeded 皆為遠端帳號上下文上限拒收（如個人帳號被壓縮到 32K），
+                  // 切 262K 公司帳號兜底；本地 MAX_PROMPT_BYTES（500KB）在 formatMessagesToPrompt 即已 413 攔截。
+                  const isRemoteContextLimit = error instanceof ChatGPTDesktopError
+                    && error.stage === "context_length_exceeded";
                   const canSwitchAccount = companyFallback
                     && error instanceof ChatGPTDesktopError
-                    && !["unsupported_input", "context_length_exceeded", "aborted"].includes(error.stage)
-                    && (error.status === 429 || error.status >= 500);
+                    && !["unsupported_input", "aborted"].includes(error.stage)
+                    && (isRemoteContextLimit || error.status === 429 || error.status >= 500);
                   if (canSwitchAccount) {
-                    if (error.stage === "quota_exceeded") {
-                      const count = (modelFailures.get(requestedModel) ?? 0) + 1;
-                      if (requestedModel) modelFailures.set(requestedModel, count);
-                      const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(count - 1, 4));
-                      const rawRetry = error?.details?.retryAfterMs;
-                      const safeRetry = typeof rawRetry === "number" && Number.isFinite(rawRetry) ? rawRetry : 0;
-                      const until = Date.now() + Math.max(safeRetry, recoveryBackoffMs);
-                      if (requestedModel) {
-                        modelUnavailableUntil.set(requestedModel, Math.max(modelUnavailableUntil.get(requestedModel) ?? 0, until));
-                      }
-                      for (const [slug, resetIso] of Object.entries(error?.details?.limitedModels ?? {})) {
-                        const parsed = Date.parse(String(resetIso));
-                        if (Number.isFinite(parsed) && parsed > Date.now()) {
-                          modelUnavailableUntil.set(slug, Math.max(modelUnavailableUntil.get(slug) ?? 0, parsed));
-                        }
-                      }
+                    if (error.stage === "quota_exceeded" || isRemoteContextLimit) {
+                      cooldownModel(requestedModel, error?.details?.retryAfterMs, error?.details?.limitedModels);
                     } else if (error.stage === "rate_limited" && error?.details?.accountCooldown === true) {
                       desktopFailures += 1;
                       const recoveryBackoffMs = Math.min(60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.min(desktopFailures - 1, 4));
@@ -740,6 +746,23 @@ export default async function chatgptDesktopPlugin(input, pluginOptions = {}) {
                   return sendToCompany();
                 });
                 if (desktopOutcome instanceof Response) return desktopOutcome;
+                const desktopModelSwapped = companyFallback
+                  && Boolean(requestedModel)
+                  && typeof desktopOutcome?.model === "string"
+                  && desktopOutcome.model.length > 0
+                  && desktopOutcome.model !== requestedModel;
+                if (desktopModelSwapped) {
+                  cooldownModel(requestedModel, 0, null);
+                  if (init?.signal?.aborted) {
+                    throw new ChatGPTDesktopError("請求已取消", {
+                      stage: "aborted",
+                      retrySafe: true,
+                      status: 502,
+                      details: { aborted: true },
+                    });
+                  }
+                  return await sendToCompany();
+                }
                 desktopFailures = 0;
                 desktopUnavailableUntil = 0;
                 if (requestedModel) {
